@@ -128,8 +128,136 @@ def get_and_clear_voice():
     return local_voice
 
 
+def resolve_rule_approval(user_response_text, manual_yes, manual_no):
+    if manual_yes:
+        return True
+    if manual_no:
+        return False
+    pos_kws = ["응", "어", "네", "예", "조정", "해줘", "맞아", "오케이", "ok", "좋아"]
+    normalized = user_response_text.replace(" ", "")
+    return any(kw in normalized for kw in pos_kws)
+
+
+def compute_cycle_averages(shoulder_angles, elbow_angles, rula_scores):
+    avg_sh = sum(shoulder_angles) / len(shoulder_angles) if shoulder_angles else 30.0
+    avg_elb = sum(elbow_angles) / len(elbow_angles) if elbow_angles else 80.0
+    avg_rula = sum(rula_scores) / len(rula_scores) if rula_scores else 2.0
+    return avg_sh, avg_elb, avg_rula
+
+
+def decide_returning_policy(condition, cycle_avg_sh):
+    lead_type = condition["lead"]
+    control_type = condition["control"]
+    is_risky = cycle_avg_sh >= 90.0
+
+    if control_type == "None":
+        return {
+            "mode": "auto",
+            "message": "비개입 조건이므로 기존 높이를 그대로 유지합니다.",
+            "is_approved_rule": False,
+            "is_risky": is_risky,
+        }
+
+    if not is_risky:
+        return {
+            "mode": "auto",
+            "message": "안전한 자세입니다. 동일한 높이로 다음 사이클을 진행합니다.",
+            "is_approved_rule": False,
+            "is_risky": False,
+        }
+
+    if lead_type == "System":
+        return {
+            "mode": "auto",
+            "message": "방금 전 위험 자세가 감지되어 시스템이 다음 높이를 보정합니다.",
+            "is_approved_rule": True,
+            "is_risky": True,
+        }
+
+    return {
+        "mode": "ask_worker",
+        "message": "방금 전 자세 불편이 감지되었습니다. 높이 조정을 진행할까요?",
+        "is_approved_rule": False,
+        "is_risky": True,
+    }
+
+
 def main():
     global running, voice_command
+
+    def apply_next_target(user_response_text, is_approved_rule):
+        # RETURNING 평가가 끝난 뒤 다음 cycle에 쓸 target_z를 계산하고,
+        # 필요하면 새 pass goal JSON을 저장/전송한다.
+        nonlocal trial_count, current_tighten_z_mm, awaiting_worker_answer, completion_sent
+
+        trial_count += 1
+        metrics["completed_transfers"] = trial_count
+        metrics["total_rula_score"] += cycle_avg_rula
+        cycle_duration = time.time() - cycle_start_time if cycle_start_time else 0.0
+        cycle_durations.append(cycle_duration)
+
+        if not user_response_text:
+            user_response_text = f"Tightened with avg shoulder {cycle_avg_sh:.1f} deg"
+
+        llm_start_time = time.time()
+        llm_result = experiment_controller.run_task(
+            condition=current_condition,
+            sh_angle=shoulder_ang,
+            avg_sh_angle=cycle_avg_sh,
+            elb_angle=cycle_avg_elb,
+            target_pass_floor_z_mm=current_tighten_z_mm,
+            adj_mm=0.0,
+            current_pass_floor_z_mm=current_tighten_z_mm,
+            h_sh=user_shoulder_height_cm * 10,
+            l1=l1_cm * 10,
+            l2=l2_cm * 10,
+            user_voice_text=user_response_text,
+            is_approved_rule=is_approved_rule,
+        )
+        latency = time.time() - llm_start_time
+        if current_condition["control"] == "LLM":
+            llm_latencies.append(latency)
+
+        next_target_z_m = llm_result.get("final_z_m", current_tighten_z_mm / 1000.0)
+        next_target_z_mm = next_target_z_m * 1000.0
+
+        adj_mag = abs(next_target_z_mm - current_tighten_z_mm)
+        metrics["total_adjustment_magnitude_mm"] += adj_mag
+        if adj_mag > 10.0:
+            metrics["robot_adjustment_count"] += 1
+        if llm_result.get("is_correction"):
+            metrics["correction_commands_count"] += 1
+        if llm_result.get("is_invalid"):
+            metrics["invalid_cmds"] += 1
+
+        should_send_next_goal = abs(next_target_z_mm - current_tighten_z_mm) > 1e-6
+        current_tighten_z_mm = next_target_z_mm
+
+        if should_send_next_goal:
+            SendPassGoal({"target_z_mm": current_tighten_z_mm, "msg": f"Trial {trial_count} Setup"})
+        else:
+            print("[PASS_GOAL 생략] 이전 목표를 그대로 유지합니다.")
+
+        append_coordinate_log(trial_count, current_tighten_z_mm)
+
+        raw_file_exists = os.path.isfile(RAW_CSV_FILENAME)
+        with open(RAW_CSV_FILENAME, "a", encoding="utf-8-sig") as f:
+            if not raw_file_exists:
+                f.write("Time,Condition,Trial_Num,Lead_Type,Control_Type,Avg_Shoulder,Avg_Elbow,RULA,User_Voice,Final_Z_m,Is_Approved,LLM_Latency_s,Is_Invalid\n")
+            f.write(
+                f"{time.strftime('%Y-%m-%d %H:%M:%S')},{current_condition['name']},{trial_count},"
+                f"{current_condition['lead']},{current_condition['control']},{cycle_avg_sh:.1f},{cycle_avg_elb:.1f},"
+                f"{cycle_avg_rula:.1f},{user_response_text},{next_target_z_m:.3f},{llm_result.get('is_approved', is_approved_rule)},{latency:.2f},{llm_result.get('is_invalid', False)}\n"
+            )
+
+        SetReviewPending(False)
+        awaiting_worker_answer = False
+        completion_sent = False
+
+        if trial_count < TOTAL_TRIALS_PER_CONDITION:
+            speak("다음 사이클을 준비합니다. 로봇 상태가 AT_TASK가 되면 다시 측정을 시작합니다.")
+            with voice_lock:
+                voice_command = None
 
     print("\n" + "=" * 60)
     print(" 🧑‍🔧 피실험자 신체 정보 입력 (엔터키를 누르면 괄호 안의 기본값 적용)")
@@ -196,7 +324,6 @@ def main():
     cycle_durations = []
     llm_latencies = []
 
-    current_state = "INIT_START"
     trial_count = 0
     cycle_start_time = 0.0
     wait_start_time = 0.0
@@ -209,20 +336,21 @@ def main():
     cycle_avg_sh = 0.0
     cycle_avg_elb = 0.0
     cycle_avg_rula = 0.0
-    user_response_text = ""
-    is_approved_rule = False
+    completion_sent = False
     key = -1
+
+    awaiting_worker_answer = False
 
     robot_state = "UNKNOWN"
     previous_robot_state = None
     next_robot_state_poll_time = 0.0
-    review_pending_sent = False
 
     while cap.isOpened() and trial_count < TOTAL_TRIALS_PER_CONDITION:
         ret, frame = cap.read()
         if not ret:
             break
 
+        # HTTP bridge가 주는 최신 로봇 상태를 주기적으로 읽는다.
         now = time.time()
         if now >= next_robot_state_poll_time:
             fetched_robot_state = GetRobotState()
@@ -230,6 +358,7 @@ def main():
                 robot_state = fetched_robot_state
             next_robot_state_poll_time = now + ROBOT_STATE_POLL_SEC
 
+        # 매 프레임마다 자세를 추정해 현재 어깨/팔꿈치 각도와 RULA를 계산한다.
         frame = cv2.flip(frame, 1)
         image_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         results = mp_pose_instance.process(image_rgb)
@@ -246,33 +375,43 @@ def main():
             elbow_ang = calculate_angle(shoulder, elbow, wrist)
             current_rula = estimate_rula_score(shoulder_ang, elbow_ang)
 
-        if current_state == "INIT_START":
-            speak(f"[{current_condition['name']}] 첫 번째 조립 위치를 전송합니다.")
-            SendPassGoal({"target_z_mm": current_tighten_z_mm, "msg": "Initial move"})
+        entered_at_task = robot_state == "AT_TASK" and previous_robot_state != "AT_TASK"
+        entered_returning = robot_state == "RETURNING" and previous_robot_state != "RETURNING"
+        entered_picking = robot_state == "PICKING" and previous_robot_state != "PICKING"
+        entered_idle = robot_state == "IDLE" and previous_robot_state != "IDLE"
+
+        # Sequence 1) PICKING: 로봇이 다음 pass 위치를 준비하는 구간.
+        # HRI는 이전 cycle 흔적만 정리하고 다음 AT_TASK를 기다린다.
+        if entered_picking:
+            awaiting_worker_answer = False
+            completion_sent = False
             SetReviewPending(False)
-            append_coordinate_log(0, current_tighten_z_mm)
-            current_state = "WAIT_FOR_TASK"
 
-        elif current_state == "WAIT_FOR_TASK":
-            if robot_state == "AT_TASK" and previous_robot_state != "AT_TASK":
-                with voice_lock:
-                    voice_command = None
+        # Sequence 2) AT_TASK 진입: 작업자가 실제 체결을 시작하는 시점.
+        # 이 순간부터 한 cycle의 자세 측정을 새로 시작한다.
+        if entered_at_task:
+            with voice_lock:
+                voice_command = None
+            if previous_robot_state != "AT_TASK":
                 speak("블록의 네 개 구멍에 볼트를 체결해 주세요.")
-                cycle_start_time = time.time()
-                accumulated_shoulder_angles.clear()
-                accumulated_elbow_angles.clear()
-                accumulated_rula_scores.clear()
-                review_pending_sent = False
-                current_state = "BOLT_TIGHTENING"
+            cycle_start_time = time.time()
+            accumulated_shoulder_angles.clear()
+            accumulated_elbow_angles.clear()
+            accumulated_rula_scores.clear()
+            awaiting_worker_answer = False
+            completion_sent = False
 
-        elif current_state == "BOLT_TIGHTENING":
-            if robot_state == "AT_TASK" and shoulder_ang > 0:
-                accumulated_shoulder_angles.append(shoulder_ang)
-                accumulated_elbow_angles.append(elbow_ang)
-                accumulated_rula_scores.append(current_rula)
-                if current_rula >= 4:
-                    metrics["risky_posture_time_sec"] += 0.1
+        # Sequence 3) AT_TASK 유지: 작업 중 프레임별 자세값을 계속 누적한다.
+        if robot_state == "AT_TASK" and shoulder_ang > 0:
+            accumulated_shoulder_angles.append(shoulder_ang)
+            accumulated_elbow_angles.append(elbow_ang)
+            accumulated_rula_scores.append(current_rula)
+            if current_rula >= 4:
+                metrics["risky_posture_time_sec"] += 0.1
 
+        # Sequence 4) AT_TASK 완료 처리: 작업 완료 음성/키 입력이 들어오면
+        # hold_finished를 보내고, 이번 cycle의 평균 자세값을 확정한다.
+        if robot_state == "AT_TASK" and not completion_sent:
             local_voice = get_and_clear_voice()
             kw_list = ["끝", "완료", "다했", "체결", "조립", "다 했", "완료했", "마무리", "오케이"]
             voice_detected = local_voice and any(kw in local_voice for kw in kw_list)
@@ -284,53 +423,39 @@ def main():
                     print(f"[작업 완료 음성 감지]: '{local_voice}'")
                 speak("조립 완료를 로봇에 전달합니다.")
                 SendHoldFinished()
+                cycle_avg_sh, cycle_avg_elb, cycle_avg_rula = compute_cycle_averages(
+                    accumulated_shoulder_angles,
+                    accumulated_elbow_angles,
+                    accumulated_rula_scores,
+                )
+                completion_sent = True
 
-                cycle_avg_sh = sum(accumulated_shoulder_angles) / len(accumulated_shoulder_angles) if accumulated_shoulder_angles else 30.0
-                cycle_avg_elb = sum(accumulated_elbow_angles) / len(accumulated_elbow_angles) if accumulated_elbow_angles else 80.0
-                cycle_avg_rula = sum(accumulated_rula_scores) / len(accumulated_rula_scores) if accumulated_rula_scores else 2.0
-
-                current_state = "WAIT_FOR_RETURNING"
-
-        elif current_state == "WAIT_FOR_RETURNING":
-            if robot_state == "RETURNING" and not review_pending_sent:
-                SetReviewPending(True)
-                review_pending_sent = True
-                current_state = "EVALUATE_POSTURE"
-
-        elif current_state == "EVALUATE_POSTURE":
-            lead_type = current_condition["lead"]
-            control_type = current_condition["control"]
-            is_risky = cycle_avg_sh >= 90.0
-
+        # Sequence 5) RETURNING 진입: 작업이 끝나 로봇이 복귀하기 시작한 시점.
+        # 여기서 5개 컨디션 중 현재 조건에 맞춰 자동 유지/자동 보정/작업자 질문을 결정한다.
+        if entered_returning and completion_sent:
+            SetReviewPending(True)
             user_response_text = ""
-            is_approved_rule = False
+            policy = decide_returning_policy(current_condition, cycle_avg_sh)
+            speak(policy["message"])
 
-            if control_type == "None":
-                speak("비개입 조건이므로 기존 높이를 그대로 유지합니다.")
-                current_state = "APPLY_NEXT_TARGET"
-            elif is_risky:
-                if lead_type == "System":
-                    speak("방금 전 위험 자세가 감지되어 시스템이 다음 높이를 보정합니다.")
+            if policy["mode"] == "auto":
+                if policy["is_risky"] and current_condition["lead"] == "System":
                     metrics["system_intervention_count"] += 1
-                    is_approved_rule = True
-                    current_state = "APPLY_NEXT_TARGET"
-                else:
-                    speak("방금 전 자세 불편이 감지되었습니다. 높이 조정을 진행할까요?")
-                    with voice_lock:
-                        voice_command = None
-                    wait_start_time = time.time()
-                    current_state = "WAIT_ADJUST_ANSWER"
+                apply_next_target(user_response_text, policy["is_approved_rule"])
             else:
-                speak("안전한 자세입니다. 동일한 높이로 다음 사이클을 진행합니다.")
-                current_state = "APPLY_NEXT_TARGET"
+                with voice_lock:
+                    voice_command = None
+                wait_start_time = time.time()
+                awaiting_worker_answer = True
 
-        elif current_state == "WAIT_ADJUST_ANSWER":
+        # Sequence 6) Worker 주도 조건에서만: RETURNING 중 작업자 답변을 기다렸다가
+        # LLM 또는 Rule 계산에 반영해 다음 target_z를 만든다.
+        if robot_state == "RETURNING" and awaiting_worker_answer:
             elapsed_wait = time.time() - wait_start_time
             cv2.putText(frame, f"Waiting Answer... {5.0 - elapsed_wait:.1f}s", (20, 190), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 165, 255), 2)
 
             local_voice = get_and_clear_voice()
-            if local_voice:
-                user_response_text = local_voice
+            user_response_text = local_voice or ""
 
             manual_yes = key == ord("y") or key == ord("Y")
             manual_no = key == ord("n") or key == ord("N")
@@ -347,90 +472,27 @@ def main():
                 else:
                     print("[대답 없음] 기본값으로 진행합니다.")
 
+                is_approved_rule = False
                 if current_condition["control"] != "LLM":
-                    if manual_yes:
-                        is_approved_rule = True
-                    elif manual_no:
-                        is_approved_rule = False
-                    else:
-                        pos_kws = ["응", "어", "네", "예", "조정", "해줘", "맞아", "오케이", "ok", "좋아"]
-                        normalized = user_response_text.replace(" ", "")
-                        is_approved_rule = any(kw in normalized for kw in pos_kws)
-                current_state = "APPLY_NEXT_TARGET"
+                    is_approved_rule = resolve_rule_approval(user_response_text, manual_yes, manual_no)
+                apply_next_target(user_response_text, is_approved_rule)
 
-        elif current_state == "APPLY_NEXT_TARGET":
-            trial_count += 1
-            metrics["completed_transfers"] = trial_count
-            metrics["total_rula_score"] += cycle_avg_rula
-            cycle_duration = time.time() - cycle_start_time if cycle_start_time else 0.0
-            cycle_durations.append(cycle_duration)
+        # Sequence 7) IDLE: 한 cycle이 완전히 끝난 뒤의 대기 구간.
+        if entered_idle:
+            awaiting_worker_answer = False
+            completion_sent = False
 
-            if not user_response_text:
-                user_response_text = f"Tightened with avg shoulder {cycle_avg_sh:.1f} deg"
+        # 화면에는 로봇 상태와 HRI가 현재 어느 단계에 있는지 함께 표시한다.
+        if robot_state == "AT_TASK":
+            hri_phase_label = "AT_TASK_MEASURING"
+        elif robot_state == "RETURNING" and awaiting_worker_answer:
+            hri_phase_label = "RETURNING_WAIT_ANSWER"
+        elif robot_state == "RETURNING":
+            hri_phase_label = "RETURNING_REVIEW"
+        else:
+            hri_phase_label = robot_state
 
-            llm_start_time = time.time()
-            llm_result = experiment_controller.run_task(
-                condition=current_condition,
-                sh_angle=shoulder_ang,
-                avg_sh_angle=cycle_avg_sh,
-                elb_angle=cycle_avg_elb,
-                target_pass_floor_z_mm=current_tighten_z_mm,
-                adj_mm=0.0,
-                current_pass_floor_z_mm=current_tighten_z_mm,
-                h_sh=user_shoulder_height_cm * 10,
-                l1=l1_cm * 10,
-                l2=l2_cm * 10,
-                user_voice_text=user_response_text,
-                is_approved_rule=is_approved_rule,
-            )
-            latency = time.time() - llm_start_time
-            if current_condition["control"] == "LLM":
-                llm_latencies.append(latency)
-
-            next_target_z_m = llm_result.get("final_z_m", current_tighten_z_mm / 1000.0)
-            next_target_z_mm = next_target_z_m * 1000.0
-
-            adj_mag = abs(next_target_z_mm - current_tighten_z_mm)
-            metrics["total_adjustment_magnitude_mm"] += adj_mag
-            if adj_mag > 10.0:
-                metrics["robot_adjustment_count"] += 1
-            if llm_result.get("is_correction"):
-                metrics["correction_commands_count"] += 1
-            if llm_result.get("is_invalid"):
-                metrics["invalid_cmds"] += 1
-
-            should_send_next_goal = abs(next_target_z_mm - current_tighten_z_mm) > 1e-6
-            current_tighten_z_mm = next_target_z_mm
-
-            if should_send_next_goal:
-                SendPassGoal({"target_z_mm": current_tighten_z_mm, "msg": f"Trial {trial_count} Setup"})
-            else:
-                print("[PASS_GOAL 생략] 이전 목표를 그대로 유지합니다.")
-
-            append_coordinate_log(trial_count, current_tighten_z_mm)
-
-            raw_file_exists = os.path.isfile(RAW_CSV_FILENAME)
-            with open(RAW_CSV_FILENAME, "a", encoding="utf-8-sig") as f:
-                if not raw_file_exists:
-                    f.write("Time,Condition,Trial_Num,Lead_Type,Control_Type,Avg_Shoulder,Avg_Elbow,RULA,User_Voice,Final_Z_m,Is_Approved,LLM_Latency_s,Is_Invalid\n")
-                f.write(
-                    f"{time.strftime('%Y-%m-%d %H:%M:%S')},{current_condition['name']},{trial_count},"
-                    f"{current_condition['lead']},{current_condition['control']},{cycle_avg_sh:.1f},{cycle_avg_elb:.1f},"
-                    f"{cycle_avg_rula:.1f},{user_response_text},{next_target_z_m:.3f},{llm_result.get('is_approved', is_approved_rule)},{latency:.2f},{llm_result.get('is_invalid', False)}\n"
-                )
-
-            SetReviewPending(False)
-            review_pending_sent = False
-
-            if trial_count < TOTAL_TRIALS_PER_CONDITION:
-                speak("다음 사이클을 준비합니다. 로봇이 작업 위치에 도착하면 다시 측정을 시작합니다.")
-                with voice_lock:
-                    voice_command = None
-                current_state = "WAIT_FOR_TASK"
-            else:
-                current_state = "END_EXPERIMENT"
-
-        cv2.putText(frame, f"HRI State: {current_state}", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+        cv2.putText(frame, f"HRI State: {hri_phase_label}", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
         cv2.putText(frame, f"Robot State: {robot_state}", (20, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 220, 0), 2)
         cv2.putText(frame, f"Trial: {trial_count}/{TOTAL_TRIALS_PER_CONDITION}", (20, 100), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
         cv2.putText(frame, f"Live RULA: {current_rula}", (20, 130), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
