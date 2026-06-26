@@ -3,6 +3,7 @@ import cv2
 import json
 import math
 import os
+import queue
 import threading
 import time
 
@@ -22,13 +23,13 @@ from hri_http_sender import GetRobotState, SendHoldFinished, SendPassGoal, SetRe
 # =========================================================
 # API 및 환경 설정
 # =========================================================
-OPENAI_API_KEY = "apikey"  # ⚠️ 여기에 실제 Groq API 키를 입력하세요.
+OPENAI_API_KEY = ""  # ⚠️ 여기에 실제 Groq API 키를 입력하세요.
 LLAMA_BASE_URL = "https://api.groq.com/openai/v1"
 
 TOTAL_TRIALS_PER_CONDITION = 10
 DEFAULT_PASS_FLOOR_Z_CM = 135.5
 ROBOT_STATE_POLL_SEC = 0.2
-RISK_SHOULDER_DEG = 130.0
+RISK_SHOULDER_DEG = 110.0
 LINK0_HEIGHT_MM = 634.0
 MIN_LINK0_Z_M = 0.634
 MAX_LINK0_Z_M = 1.200
@@ -52,17 +53,47 @@ voice_command = None
 voice_lock = threading.Lock()
 running = True
 coordinate_logs = []
+tts_queue = queue.Queue()
+tts_worker_started = False
+tts_worker_lock = threading.Lock()
+
+
+def tts_worker():
+    engine = None
+    while True:
+        text = tts_queue.get()
+        try:
+            if engine is None:
+                engine = pyttsx3.init()
+            engine.say(text)
+            engine.runAndWait()
+        except Exception as e:
+            print(f"[TTS ERROR] {e}")
+            try:
+                if engine is not None:
+                    engine.stop()
+            except Exception:
+                pass
+            engine = None
+        finally:
+            tts_queue.task_done()
+
+
+def ensure_tts_worker_started():
+    global tts_worker_started
+    if tts_worker_started:
+        return
+    with tts_worker_lock:
+        if tts_worker_started:
+            return
+        threading.Thread(target=tts_worker, daemon=True).start()
+        tts_worker_started = True
 
 
 def speak(text):
     print(f"[TTS] {text}")
-
-    def _speak():
-        engine = pyttsx3.init()
-        engine.say(text)
-        engine.runAndWait()
-
-    threading.Thread(target=_speak, daemon=True).start()
+    ensure_tts_worker_started()
+    tts_queue.put(text)
 
 
 def speech_recognition_thread():
@@ -196,15 +227,15 @@ def compute_recommended_floor_z_mm(
     shoulder_height_mm,
     upper_arm_mm,
     forearm_mm,
-    shoulder_angle_deg,
-    elbow_angle_deg,
+    target_shoulder_angle_deg,
 ):
-    shoulder_rad = math.radians(shoulder_angle_deg)
-    elbow_rad = math.radians(elbow_angle_deg)
+    shoulder_rad = math.radians(target_shoulder_angle_deg)
     return (
         shoulder_height_mm
-        - upper_arm_mm * math.cos(shoulder_rad)
-        + forearm_mm * math.cos(elbow_rad)
+        - (
+            upper_arm_mm * math.cos(shoulder_rad)
+            + forearm_mm * math.cos(math.radians(0.0))
+        )
     )
 
 
@@ -294,15 +325,19 @@ def main():
         if not user_response_text:
             user_response_text = f"Tightened with avg shoulder {cycle_avg_sh:.1f} deg"
 
+        control_type = current_condition["control"]
+        if control_type == "Rule":
+            target_shoulder_angle_deg = cycle_avg_sh - 20.0
+        else:
+            target_shoulder_angle_deg = 20.0
+
         recommended_floor_z_mm = compute_recommended_floor_z_mm(
             user_shoulder_height_cm * 10,
             l1_cm * 10,
             l2_cm * 10,
-            cycle_avg_sh,
-            cycle_avg_elb,
+            target_shoulder_angle_deg,
         )
 
-        control_type = current_condition["control"]
         if control_type == "LLM":
             llm_result, latency = run_llm_interface(user_response_text, recommended_floor_z_mm)
             llm_latencies.append(latency)
