@@ -28,6 +28,10 @@ LLAMA_BASE_URL = "https://api.groq.com/openai/v1"
 TOTAL_TRIALS_PER_CONDITION = 10
 DEFAULT_PASS_FLOOR_Z_CM = 135.5
 ROBOT_STATE_POLL_SEC = 0.2
+RISK_SHOULDER_DEG = 130.0
+LINK0_HEIGHT_MM = 634.0
+MIN_LINK0_Z_M = 0.634
+MAX_LINK0_Z_M = 1.200
 
 RESULT_DIR = os.path.join(os.path.dirname(__file__), "results")
 os.makedirs(RESULT_DIR, exist_ok=True)
@@ -128,6 +132,45 @@ def get_and_clear_voice():
     return local_voice
 
 
+def detect_task_completion(key):
+    local_voice = get_and_clear_voice()
+    kw_list = ["끝", "완료", "다했", "체결", "조립", "다 했", "완료했", "마무리", "오케이"]
+    voice_detected = local_voice and any(kw in local_voice for kw in kw_list)
+
+    if key == ord(" "):
+        print("[수동 조작 감지]: 스페이스바(완료) 눌림")
+        return True
+    if voice_detected:
+        print(f"[작업 완료 음성 감지]: '{local_voice}'")
+        return True
+    return False
+
+
+def poll_worker_adjust_answer(wait_start_time, key):
+    elapsed_wait = time.time() - wait_start_time
+    local_voice = get_and_clear_voice()
+    user_response_text = local_voice or ""
+
+    manual_yes = key == ord("y") or key == ord("Y")
+    manual_no = key == ord("n") or key == ord("N")
+
+    if not (user_response_text or elapsed_wait > 5.0 or manual_yes or manual_no):
+        return False, "", False, False, elapsed_wait
+
+    if manual_yes:
+        user_response_text = "Yes, please adjust (Manual)"
+        print("[수동 조작 감지]: Y 키 (조정 승인)")
+    elif manual_no:
+        user_response_text = "No, keep it (Manual)"
+        print("[수동 조작 감지]: N 키 (조정 거절)")
+    elif user_response_text:
+        print(f"[작업자 답변]: '{user_response_text}'")
+    else:
+        print("[대답 없음] 기본값으로 진행합니다.")
+
+    return True, user_response_text, manual_yes, manual_no, elapsed_wait
+
+
 def resolve_rule_approval(user_response_text, manual_yes, manual_no):
     if manual_yes:
         return True
@@ -145,10 +188,44 @@ def compute_cycle_averages(shoulder_angles, elbow_angles, rula_scores):
     return avg_sh, avg_elb, avg_rula
 
 
+def is_risky_posture(avg_shoulder_angle_deg):
+    return avg_shoulder_angle_deg >= RISK_SHOULDER_DEG
+
+
+def compute_recommended_floor_z_mm(
+    shoulder_height_mm,
+    upper_arm_mm,
+    forearm_mm,
+    shoulder_angle_deg,
+    elbow_angle_deg,
+):
+    shoulder_rad = math.radians(shoulder_angle_deg)
+    elbow_rad = math.radians(elbow_angle_deg)
+    return (
+        shoulder_height_mm
+        - upper_arm_mm * math.cos(shoulder_rad)
+        + forearm_mm * math.cos(elbow_rad)
+    )
+
+
+def floor_z_mm_to_link0_m(floor_z_mm):
+    return (floor_z_mm - LINK0_HEIGHT_MM) / 1000.0
+
+
+def link0_m_to_floor_z_mm(link0_z_m):
+    return link0_z_m * 1000.0 + LINK0_HEIGHT_MM
+
+
+def clamp_floor_z_mm_to_robot_limits(floor_z_mm):
+    link0_z_m = floor_z_mm_to_link0_m(floor_z_mm)
+    clamped_link0_z_m = max(MIN_LINK0_Z_M, min(MAX_LINK0_Z_M, link0_z_m))
+    return link0_m_to_floor_z_mm(clamped_link0_z_m)
+
+
 def decide_returning_policy(condition, cycle_avg_sh):
     lead_type = condition["lead"]
     control_type = condition["control"]
-    is_risky = cycle_avg_sh >= 90.0
+    is_risky = is_risky_posture(cycle_avg_sh)
 
     if control_type == "None":
         return {
@@ -185,6 +262,24 @@ def decide_returning_policy(condition, cycle_avg_sh):
 def main():
     global running, voice_command
 
+    def run_llm_interface(user_response_text, recommended_floor_z_mm):
+        llm_start_time = time.time()
+        llm_result = experiment_controller.run_task(
+            condition=current_condition,
+            sh_angle=shoulder_ang,
+            avg_sh_angle=cycle_avg_sh,
+            elb_angle=cycle_avg_elb,
+            target_pass_floor_z_mm=recommended_floor_z_mm,
+            adj_mm=0.0,
+            current_pass_floor_z_mm=current_tighten_z_mm,
+            h_sh=user_shoulder_height_cm * 10,
+            l1=l1_cm * 10,
+            l2=l2_cm * 10,
+            user_voice_text=user_response_text,
+            is_approved_rule=False,
+        )
+        return llm_result, time.time() - llm_start_time
+
     def apply_next_target(user_response_text, is_approved_rule):
         # RETURNING 평가가 끝난 뒤 다음 cycle에 쓸 target_z를 계산하고,
         # 필요하면 새 pass goal JSON을 저장/전송한다.
@@ -199,42 +294,55 @@ def main():
         if not user_response_text:
             user_response_text = f"Tightened with avg shoulder {cycle_avg_sh:.1f} deg"
 
-        llm_start_time = time.time()
-        llm_result = experiment_controller.run_task(
-            condition=current_condition,
-            sh_angle=shoulder_ang,
-            avg_sh_angle=cycle_avg_sh,
-            elb_angle=cycle_avg_elb,
-            target_pass_floor_z_mm=current_tighten_z_mm,
-            adj_mm=0.0,
-            current_pass_floor_z_mm=current_tighten_z_mm,
-            h_sh=user_shoulder_height_cm * 10,
-            l1=l1_cm * 10,
-            l2=l2_cm * 10,
-            user_voice_text=user_response_text,
-            is_approved_rule=is_approved_rule,
+        recommended_floor_z_mm = compute_recommended_floor_z_mm(
+            user_shoulder_height_cm * 10,
+            l1_cm * 10,
+            l2_cm * 10,
+            cycle_avg_sh,
+            cycle_avg_elb,
         )
-        latency = time.time() - llm_start_time
-        if current_condition["control"] == "LLM":
-            llm_latencies.append(latency)
 
-        next_target_z_m = llm_result.get("final_z_m", current_tighten_z_mm / 1000.0)
-        next_target_z_mm = next_target_z_m * 1000.0
+        control_type = current_condition["control"]
+        if control_type == "LLM":
+            llm_result, latency = run_llm_interface(user_response_text, recommended_floor_z_mm)
+            llm_latencies.append(latency)
+            final_floor_z_m = llm_result.get("final_z_m", current_tighten_z_mm / 1000.0)
+            next_target_z_mm = final_floor_z_m * 1000.0
+            is_approved = llm_result.get("is_approved", is_approved_rule)
+            is_correction = llm_result.get("is_correction", False)
+            is_invalid = llm_result.get("is_invalid", False)
+        elif control_type == "Rule" and is_approved_rule:
+            latency = 0.0
+            next_target_z_mm = recommended_floor_z_mm
+            is_approved = True
+            is_correction = False
+            is_invalid = False
+        else:
+            latency = 0.0
+            next_target_z_mm = current_tighten_z_mm
+            is_approved = False
+            is_correction = False
+            is_invalid = False
+
+        next_target_z_mm = clamp_floor_z_mm_to_robot_limits(next_target_z_mm)
+        next_target_floor_z_m = next_target_z_mm / 1000.0
 
         adj_mag = abs(next_target_z_mm - current_tighten_z_mm)
         metrics["total_adjustment_magnitude_mm"] += adj_mag
         if adj_mag > 10.0:
             metrics["robot_adjustment_count"] += 1
-        if llm_result.get("is_correction"):
+        if is_correction:
             metrics["correction_commands_count"] += 1
-        if llm_result.get("is_invalid"):
+        if is_invalid:
             metrics["invalid_cmds"] += 1
 
         should_send_next_goal = abs(next_target_z_mm - current_tighten_z_mm) > 1e-6
         current_tighten_z_mm = next_target_z_mm
 
         if should_send_next_goal:
-            SendPassGoal({"target_z_mm": current_tighten_z_mm, "msg": f"Trial {trial_count} Setup"})
+            # Receiver key is kept for compatibility, but the value is link0 기준 m.
+            target_z_link0_m = floor_z_mm_to_link0_m(next_target_z_mm)
+            SendPassGoal({"target_z_mm": target_z_link0_m, "msg": f"Trial {trial_count} Setup"})
         else:
             print("[PASS_GOAL 생략] 이전 목표를 그대로 유지합니다.")
 
@@ -247,7 +355,7 @@ def main():
             f.write(
                 f"{time.strftime('%Y-%m-%d %H:%M:%S')},{current_condition['name']},{trial_count},"
                 f"{current_condition['lead']},{current_condition['control']},{cycle_avg_sh:.1f},{cycle_avg_elb:.1f},"
-                f"{cycle_avg_rula:.1f},{user_response_text},{next_target_z_m:.3f},{llm_result.get('is_approved', is_approved_rule)},{latency:.2f},{llm_result.get('is_invalid', False)}\n"
+                f"{cycle_avg_rula:.1f},{user_response_text},{next_target_floor_z_m:.3f},{is_approved},{latency:.2f},{is_invalid}\n"
             )
 
         SetReviewPending(False)
@@ -260,7 +368,7 @@ def main():
                 voice_command = None
 
     print("\n" + "=" * 60)
-    print(" 🧑‍🔧 피실험자 신체 정보 입력 (엔터키를 누르면 괄호 안의 기본값 적용)")
+    print(" 피실험자 신체 정보 입력 (엔터키를 누르면 괄호 안의 기본값 적용)")
     print("=" * 60)
 
     try:
@@ -412,15 +520,7 @@ def main():
         # Sequence 4) AT_TASK 완료 처리: 작업 완료 음성/키 입력이 들어오면
         # hold_finished를 보내고, 이번 cycle의 평균 자세값을 확정한다.
         if robot_state == "AT_TASK" and not completion_sent:
-            local_voice = get_and_clear_voice()
-            kw_list = ["끝", "완료", "다했", "체결", "조립", "다 했", "완료했", "마무리", "오케이"]
-            voice_detected = local_voice and any(kw in local_voice for kw in kw_list)
-
-            if voice_detected or key == ord(" "):
-                if key == ord(" "):
-                    print("[수동 조작 감지]: 스페이스바(완료) 눌림")
-                else:
-                    print(f"[작업 완료 음성 감지]: '{local_voice}'")
+            if detect_task_completion(key):
                 speak("조립 완료를 로봇에 전달합니다.")
                 SendHoldFinished()
                 cycle_avg_sh, cycle_avg_elb, cycle_avg_rula = compute_cycle_averages(
@@ -451,27 +551,13 @@ def main():
         # Sequence 6) Worker 주도 조건에서만: RETURNING 중 작업자 답변을 기다렸다가
         # LLM 또는 Rule 계산에 반영해 다음 target_z를 만든다.
         if robot_state == "RETURNING" and awaiting_worker_answer:
-            elapsed_wait = time.time() - wait_start_time
+            answered, user_response_text, manual_yes, manual_no, elapsed_wait = poll_worker_adjust_answer(
+                wait_start_time,
+                key,
+            )
             cv2.putText(frame, f"Waiting Answer... {5.0 - elapsed_wait:.1f}s", (20, 190), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 165, 255), 2)
 
-            local_voice = get_and_clear_voice()
-            user_response_text = local_voice or ""
-
-            manual_yes = key == ord("y") or key == ord("Y")
-            manual_no = key == ord("n") or key == ord("N")
-
-            if user_response_text or elapsed_wait > 5.0 or manual_yes or manual_no:
-                if manual_yes:
-                    user_response_text = "Yes, please adjust (Manual)"
-                    print("[수동 조작 감지]: Y 키 (조정 승인)")
-                elif manual_no:
-                    user_response_text = "No, keep it (Manual)"
-                    print("[수동 조작 감지]: N 키 (조정 거절)")
-                elif user_response_text:
-                    print(f"[작업자 답변]: '{user_response_text}'")
-                else:
-                    print("[대답 없음] 기본값으로 진행합니다.")
-
+            if answered:
                 is_approved_rule = False
                 if current_condition["control"] != "LLM":
                     is_approved_rule = resolve_rule_approval(user_response_text, manual_yes, manual_no)
