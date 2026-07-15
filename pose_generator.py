@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from typing import Any
 
 
-# 손목에서 드릴 끝/TCP까지의 보정 길이는 사용자별 입력을 받지 않고 27 cm로 고정한다.
+# 손목에서 드릴 끝/TCP까지의 보정 길이는 사용자별 입력을 받지 않고 21 cm로 고정한다.
 DRILL_TCP_OFFSET_CM = 21.0
 
 # pose_generator_model_summary.txt의 4차 측정 기준 모델 파라미터다.
