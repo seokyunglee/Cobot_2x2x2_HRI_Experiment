@@ -9,7 +9,12 @@ from pathlib import Path
 from typing import Any, Callable
 
 
-DEFAULT_INTENT_PROMPT_PATH = Path(__file__).with_name("prompts") / "intent_interpreter_system.md"
+PROMPTS_DIR = Path(__file__).with_name("prompts")
+DEFAULT_INTENT_PROMPT_PATH = PROMPTS_DIR / "intent_interpreter_system.md"
+
+DEFAULT_TASK_COMPLETION_PROMPT_PATH = PROMPTS_DIR / "task_completion_system.md"
+DEFAULT_SYSTEM_ADJUSTMENT_PROMPT_PATH = PROMPTS_DIR / "system_adjustment_system.md"
+DEFAULT_WORKER_ADJUSTMENT_PROMPT_PATH = PROMPTS_DIR / "worker_adjustment_system.md"
 
 ACTION_COMPLETE = "complete"
 ACTION_ADJUST = "adjust"
@@ -35,6 +40,25 @@ AMOUNT_NORMAL = 0.66
 AMOUNT_LARGE = 1.0
 VALID_AMOUNT_RATIOS = {AMOUNT_SMALL, AMOUNT_NORMAL, AMOUNT_LARGE}
 
+TASK_COMPLETION_KEYWORDS = (
+    "끝",
+    "종료",
+    "완료",
+    "다했",
+    "다 했",
+    "다됐",
+    "다 됐",
+    "끝냈",
+    "끝났",
+    "마쳤",
+    "마무리",
+    "다뺐",
+    "다 뺐",
+    "다풀었",
+    "다 풀었",
+    "done",
+)
+
 
 @dataclass
 class IntentResult:
@@ -44,6 +68,9 @@ class IntentResult:
     target_shoulder_angle_deg: float | None = None
     confidence: float = 0.0
     reason: str = ""
+    user_voice: str = ""
+    llm_latency_s: float = 0.0
+    llm_fallback: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -53,6 +80,9 @@ class IntentResult:
             "target_shoulder_angle_deg": self.target_shoulder_angle_deg,
             "confidence": self.confidence,
             "reason": self.reason,
+            "user_voice": self.user_voice,
+            "llm_latency_s": self.llm_latency_s,
+            "llm_fallback": self.llm_fallback,
         }
 
 
@@ -62,6 +92,19 @@ def manual_task_completion_from_key(key: int) -> IntentResult | None:
             action=ACTION_COMPLETE,
             confidence=1.0,
             reason="SPACE",
+        )
+    return None
+
+
+def manual_task_completion_from_text(text: str | None) -> IntentResult | None:
+    normalized = _normalize(text or "")
+    if not normalized:
+        return None
+    if _has_any(normalized, TASK_COMPLETION_KEYWORDS):
+        return IntentResult(
+            action=ACTION_COMPLETE,
+            confidence=1.0,
+            reason="task completion keyword",
         )
     return None
 
@@ -80,6 +123,22 @@ def manual_worker_answer_from_key(key: int) -> IntentResult | None:
             reason="Y key",
         )
     return None
+
+
+class RuleIntentParser:
+    # 작업완료만 rule-first로 잡는다. 높이 조정 발화는 전부 LLM으로 보낸다.
+    def parse(self, text: str | None, context: str = "any") -> str:
+        normalized = _normalize(text or "")
+        if not normalized:
+            return "unknown"
+
+        if context == "task_completion" and _has_any(normalized, TASK_COMPLETION_KEYWORDS):
+            return "complete"
+
+        if context == "any" and _has_any(normalized, TASK_COMPLETION_KEYWORDS):
+            return "complete"
+
+        return "unknown"
 
 
 class QueuedTtsSpeaker:
@@ -214,8 +273,11 @@ class LlmIntentInterpreter:
         self,
         api_key: str,
         base_url: str | None = None,
-        model: str = "llama-3.1-8b-instant",
+        model: str = "llama-3.3-70b-versatile",
         system_prompt_path: str | Path = DEFAULT_INTENT_PROMPT_PATH,
+        task_completion_prompt_path: str | Path | None = None,
+        system_adjustment_prompt_path: str | Path | None = None,
+        worker_adjustment_prompt_path: str | Path | None = None,
         temperature: float = 0.0,
     ) -> None:
         from openai import OpenAI
@@ -224,10 +286,27 @@ class LlmIntentInterpreter:
         self.model = model
         self.temperature = temperature
         self.system_prompt_path = Path(system_prompt_path)
+        self.task_completion_prompt_path = (
+            Path(task_completion_prompt_path)
+            if task_completion_prompt_path
+            else DEFAULT_TASK_COMPLETION_PROMPT_PATH
+        )
+        self.system_adjustment_prompt_path = (
+            Path(system_adjustment_prompt_path)
+            if system_adjustment_prompt_path
+            else DEFAULT_SYSTEM_ADJUSTMENT_PROMPT_PATH
+        )
+        self.worker_adjustment_prompt_path = (
+            Path(worker_adjustment_prompt_path)
+            if worker_adjustment_prompt_path
+            else DEFAULT_WORKER_ADJUSTMENT_PROMPT_PATH
+        )
+        self.last_prompt_path: Path | None = None
         self.last_latency_s = 0.0
         self.last_request_payload: dict[str, Any] | None = None
         self.last_raw_response: str | None = None
         self.last_parsed_response: dict[str, Any] | None = None
+        self.last_usage: dict[str, Any] | None = None
         self.last_error: str | None = None
 
     # 작업 중 나온 음성 문장이 "작업 완료"인지 해석한다.
@@ -240,29 +319,22 @@ class LlmIntentInterpreter:
             {
                 "task": "task_completion",
                 "utterance": utterance,
-            }
+            },
+            prompt_path=self.task_completion_prompt_path,
         )
 
-    # 리뷰 단계에서 시스템 판단 또는 작업자 답변을 조정 의도로 해석한다.
-    def interpret_adjustment(
+    # 시스템 주도 리뷰 단계에서 cycle_result만 보고 자동 조정 의도를 해석한다.
+    def interpret_system_adjustment(
         self,
-        text: str | None,
         cycle_result: Any,
         safe_min_shoulder_angle_deg: float,
         default_safe_shoulder_angle_deg: float,
         safe_max_shoulder_angle_deg: float,
-        is_first_completed_cycle: bool = False,
-        is_system_review: bool = False,
     ) -> IntentResult:
-        utterance = (text or "").strip()
-        if not utterance and not is_system_review:
-            return IntentResult(action=ACTION_NONE, reason="empty utterance")
-
-        return self._request_intent(
+        intent = self._request_intent(
             {
                 "task": "adjustment",
-                "utterance": utterance,
-                "is_first_completed_cycle": bool(is_first_completed_cycle),
+                "is_system_adjustment": True,
                 "cycle_result": {
                     "is_risky_cycle": bool(cycle_result.is_risky_cycle),
                     "representative_shoulder_angle_deg": float(cycle_result.representative_shoulder_angle_deg),
@@ -272,27 +344,113 @@ class LlmIntentInterpreter:
                     "default": float(default_safe_shoulder_angle_deg),
                     "max": float(safe_max_shoulder_angle_deg),
                 },
-            }
+            },
+            prompt_path=self.system_adjustment_prompt_path,
+        )
+        return self._attach_call_metadata(intent)
+
+    # 작업자 주도 리뷰 단계에서 작업자 발화를 조정 의도로 해석한다.
+    def interpret_worker_adjustment(
+        self,
+        text: str | None,
+        cycle_result: Any,
+        safe_min_shoulder_angle_deg: float,
+        default_safe_shoulder_angle_deg: float,
+        safe_max_shoulder_angle_deg: float,
+        current_target_shoulder_angle_deg: float,
+        is_first_completed_cycle: bool = False,
+    ) -> IntentResult:
+        utterance = (text or "").strip()
+        if not utterance:
+            return IntentResult(action=ACTION_NONE, reason="empty utterance")
+
+        intent = self._request_intent(
+            {
+                "task": "adjustment",
+                "utterance": utterance,
+                "is_first_completed_cycle": bool(is_first_completed_cycle),
+                "current_target_shoulder_angle_deg": float(current_target_shoulder_angle_deg),
+                "cycle_result": {
+                    "is_risky_cycle": bool(cycle_result.is_risky_cycle),
+                    "representative_shoulder_angle_deg": float(cycle_result.representative_shoulder_angle_deg),
+                },
+                "safe_angle_range": {
+                    "min": float(safe_min_shoulder_angle_deg),
+                    "default": float(default_safe_shoulder_angle_deg),
+                    "max": float(safe_max_shoulder_angle_deg),
+                },
+            },
+            prompt_path=self.worker_adjustment_prompt_path,
+        )
+        return self._attach_call_metadata(intent, user_voice=utterance)
+
+    def _attach_call_metadata(
+        self,
+        intent: IntentResult,
+        user_voice: str = "",
+    ) -> IntentResult:
+        intent.user_voice = user_voice
+        intent.llm_latency_s = self.last_latency_s
+        intent.llm_fallback = self.last_error is not None
+        return intent
+
+    # 기존 호출부 호환용 wrapper다. 새 코드는 system/worker 함수를 직접 호출한다.
+    def interpret_adjustment(
+        self,
+        text: str | None,
+        cycle_result: Any,
+        safe_min_shoulder_angle_deg: float,
+        default_safe_shoulder_angle_deg: float,
+        safe_max_shoulder_angle_deg: float,
+        current_target_shoulder_angle_deg: float,
+        is_first_completed_cycle: bool = False,
+        is_system_adjustment: bool = False,
+    ) -> IntentResult:
+        if is_system_adjustment:
+            return self.interpret_system_adjustment(
+                cycle_result,
+                safe_min_shoulder_angle_deg,
+                default_safe_shoulder_angle_deg,
+                safe_max_shoulder_angle_deg,
+            )
+        return self.interpret_worker_adjustment(
+            text,
+            cycle_result,
+            safe_min_shoulder_angle_deg,
+            default_safe_shoulder_angle_deg,
+            safe_max_shoulder_angle_deg,
+            current_target_shoulder_angle_deg,
+            is_first_completed_cycle=is_first_completed_cycle,
         )
 
     # 공통 LLM 호출 함수: payload를 보내고 응답 JSON을 IntentResult로 바꾼다.
-    def _request_intent(self, payload: dict[str, Any]) -> IntentResult:
+    def _request_intent(self, payload: dict[str, Any], prompt_path: str | Path | None = None) -> IntentResult:
         started_at = time.time()
+        active_prompt_path = Path(prompt_path) if prompt_path else self.system_prompt_path
+        self.last_prompt_path = active_prompt_path
         self.last_request_payload = payload
         self.last_raw_response = None
         self.last_parsed_response = None
+        self.last_usage = None
         self.last_error = None
         try:
             response = self.client.chat.completions.create(
                 model=self.model,
                 messages=[
-                    {"role": "system", "content": self.system_prompt_path.read_text(encoding="utf-8")},
+                    {"role": "system", "content": active_prompt_path.read_text(encoding="utf-8")},
                     {"role": "user", "content": json.dumps(payload, ensure_ascii=False, indent=2)},
                 ],
                 temperature=self.temperature,
                 max_tokens=300,
                 response_format={"type": "json_object"},
             )
+            usage = getattr(response, "usage", None)
+            if usage is not None:
+                self.last_usage = {
+                    "prompt_tokens": getattr(usage, "prompt_tokens", None),
+                    "completion_tokens": getattr(usage, "completion_tokens", None),
+                    "total_tokens": getattr(usage, "total_tokens", None),
+                }
             self.last_raw_response = response.choices[0].message.content or "{}"
             parsed = json.loads(self.last_raw_response.strip())
             self.last_parsed_response = parsed
@@ -317,6 +475,14 @@ def intent_from_json(parsed: dict[str, Any]) -> IntentResult:
         confidence=_float(parsed.get("confidence"), 0.0),
         reason=str(parsed.get("reason", "")),
     )
+
+
+def _normalize(text: str) -> str:
+    return text.lower().replace(" ", "")
+
+
+def _has_any(normalized: str, keywords: tuple[str, ...]) -> bool:
+    return any(keyword.lower().replace(" ", "") in normalized for keyword in keywords)
 
 
 def _float(value: Any, default: float) -> float:
