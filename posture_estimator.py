@@ -16,6 +16,8 @@ from experiment_data import PostureSample
 
 MEASURED_SIDE = "right"
 VISIBILITY_THRESHOLD = 0.6
+# Set to False to immediately fall back to the original 2D pixel-angle calculation.
+USE_3D_LANDMARK_ANGLES = True
 
 SELECTED_LANDMARKS = {
     "shoulder": mp_pose.PoseLandmark.RIGHT_SHOULDER.value,
@@ -51,14 +53,25 @@ class PostureEstimator:
         if not landmarks_visible(landmarks):
             return empty_posture_sample()
 
+        # Keep the original 2D pixel points available for an easy fallback.
         height, width, _ = frame.shape
         shoulder_pt = landmark_to_pixel(landmarks[SELECTED_LANDMARKS["shoulder"]], width, height)
         elbow_pt = landmark_to_pixel(landmarks[SELECTED_LANDMARKS["elbow"]], width, height)
         wrist_pt = landmark_to_pixel(landmarks[SELECTED_LANDMARKS["wrist"]], width, height)
         hip_pt = landmark_to_pixel(landmarks[SELECTED_LANDMARKS["hip"]], width, height)
 
-        shoulder_angle_deg = calculate_angle(hip_pt, shoulder_pt, elbow_pt)
-        elbow_angle_deg = calculate_angle(shoulder_pt, elbow_pt, wrist_pt)
+        if USE_3D_LANDMARK_ANGLES and result.pose_world_landmarks:
+            world_landmarks = result.pose_world_landmarks.landmark
+            shoulder_3d = landmark_to_point3d(world_landmarks[SELECTED_LANDMARKS["shoulder"]])
+            elbow_3d = landmark_to_point3d(world_landmarks[SELECTED_LANDMARKS["elbow"]])
+            wrist_3d = landmark_to_point3d(world_landmarks[SELECTED_LANDMARKS["wrist"]])
+            hip_3d = landmark_to_point3d(world_landmarks[SELECTED_LANDMARKS["hip"]])
+
+            shoulder_angle_deg = calculate_angle_3d(hip_3d, shoulder_3d, elbow_3d)
+            elbow_angle_deg = calculate_angle_3d(shoulder_3d, elbow_3d, wrist_3d)
+        else:
+            shoulder_angle_deg = calculate_angle(hip_pt, shoulder_pt, elbow_pt)
+            elbow_angle_deg = calculate_angle(shoulder_pt, elbow_pt, wrist_pt)
         rula_proxy = estimate_rula_score(shoulder_angle_deg, elbow_angle_deg)
 
         return PostureSample(
@@ -92,6 +105,26 @@ def landmarks_visible(landmarks) -> bool:
 
 def landmark_to_pixel(landmark, width: int, height: int) -> list[int]:
     return [int(landmark.x * width), int(landmark.y * height)]
+
+
+def landmark_to_point3d(landmark) -> list[float]:
+    """MediaPipe world landmark를 3D 좌표 벡터로 변환한다."""
+    return [landmark.x, landmark.y, landmark.z]
+
+
+def calculate_angle_3d(a: list[float], b: list[float], c: list[float]) -> float:
+    """3D 공간에서 b를 꼭짓점으로 하는 a-b-c 각도를 degree 단위로 계산한다."""
+    ba = [a[i] - b[i] for i in range(3)]
+    bc = [c[i] - b[i] for i in range(3)]
+    dot_product = sum(ba[i] * bc[i] for i in range(3))
+    mag_ba = math.sqrt(sum(value * value for value in ba))
+    mag_bc = math.sqrt(sum(value * value for value in bc))
+
+    if mag_ba == 0 or mag_bc == 0:
+        return 0.0
+
+    cosine_angle = max(-1.0, min(1.0, dot_product / (mag_ba * mag_bc)))
+    return math.degrees(math.acos(cosine_angle))
 
 
 def calculate_angle(a: list[int], b: list[int], c: list[int]) -> float:

@@ -24,6 +24,8 @@ class CycleResult:
     """한 작업 cycle이 끝났을 때 metrics가 계산한 자세/위험 결과."""
 
     task_time_s: float
+    rest_time_s: float
+    working_time_s: float
     risky_time_s: float
     risky_ratio: float
     is_risky_cycle: bool
@@ -87,13 +89,25 @@ class SummaryRecord:
     """summary CSV 한 줄에 저장할 실험 실행 단위 요약."""
 
     condition_name: str
-    completed_transfers: int
     measured_side: str
-    experiment_duration_s: float
-    avg_cycle_task_time_s: float
+    risk_shoulder_threshold_deg: float
+    risky_cycle_ratio_threshold: float
+    user_height_cm: float
+    shoulder_height_cm: float
+    upper_arm_cm: float
+    forearm_cm: float
+    drill_tcp_offset_cm: float
+    avg_representative_shoulder_angle_deg: float
+    avg_shoulder_angle_deg: float
+    avg_rula_proxy: float
     risky_time_s: float
     risky_cycle_count: int
     risky_cycle_ratio_total: float
+    completed_transfers: int
+    experiment_duration_s: float
+    avg_cycle_task_time_s: float
+    throughput_transfers_per_min: float
+    early_stop_flag: int
     system_interventions: int
     adjust_count: int
     avg_adj_mm: float
@@ -104,17 +118,6 @@ class SummaryRecord:
     llm_call_count: int
     llm_fallback_count: int
     avg_llm_latency_s: float
-    avg_representative_shoulder_angle_deg: float
-    avg_shoulder_angle_deg: float
-    avg_rula_proxy: float
-    risk_shoulder_threshold_deg: float
-    risky_cycle_ratio_threshold: float
-    user_height_cm: float
-    shoulder_height_cm: float
-    upper_arm_cm: float
-    forearm_cm: float
-    drill_tcp_offset_cm: float
-    early_stop_flag: int
 
 
 class ExperimentMetrics:
@@ -188,9 +191,11 @@ class ExperimentMetrics:
         if posture.shoulder_angle_deg >= self.risk_shoulder_deg:
             self.cycle_risky_time_s += dt
 
-    def finish_cycle(self) -> CycleResult:
+    def finish_cycle(self, rest_time_s: float = 0.0) -> CycleResult:
         """현재 cycle 누적값을 평균/비율로 정리한다."""
         task_time = self.cycle_task_time_s
+        rest_time = max(0.0, min(float(rest_time_s), task_time))
+        working_time = task_time - rest_time
         visible_time = self.cycle_visibility_ok_time_s
         risky_ratio = self.cycle_risky_time_s / visible_time if visible_time > 0 else 0.0
         visibility_ratio = self.cycle_visibility_ok_time_s / task_time if task_time > 0 else 0.0
@@ -199,6 +204,8 @@ class ExperimentMetrics:
 
         return CycleResult(
             task_time_s=task_time,
+            rest_time_s=rest_time,
+            working_time_s=working_time,
             risky_time_s=self.cycle_risky_time_s,
             risky_ratio=max(0.0, min(1.0, risky_ratio)),
             is_risky_cycle=risky_ratio >= self.risky_cycle_ratio_threshold,
@@ -274,6 +281,7 @@ class ExperimentMetrics:
         """실험 종료 시 summary CSV에 쓸 값을 만든다."""
         completed = self.completed_transfers
         avg_cycle_time = sum(self.cycle_durations) / len(self.cycle_durations) if self.cycle_durations else 0.0
+        throughput_per_min = completed * 60.0 / experiment_duration_s if experiment_duration_s > 0 else 0.0
         avg_adj_mm = self.total_adjustment_magnitude_mm / completed if completed > 0 else 0.0
         risky_cycle_ratio_total = self.risky_cycle_count / completed if completed > 0 else 0.0
         avg_llm_latency = sum(self.llm_latencies) / len(self.llm_latencies) if self.llm_latencies else 0.0
@@ -295,13 +303,25 @@ class ExperimentMetrics:
 
         return SummaryRecord(
             condition_name=condition_name,
-            completed_transfers=completed,
             measured_side=measured_side,
-            experiment_duration_s=experiment_duration_s,
-            avg_cycle_task_time_s=avg_cycle_time,
+            risk_shoulder_threshold_deg=self.risk_shoulder_deg,
+            risky_cycle_ratio_threshold=self.risky_cycle_ratio_threshold,
+            user_height_cm=user_height_cm,
+            shoulder_height_cm=shoulder_height_cm,
+            upper_arm_cm=upper_arm_cm,
+            forearm_cm=forearm_cm,
+            drill_tcp_offset_cm=drill_tcp_offset_cm,
+            avg_representative_shoulder_angle_deg=avg_representative_shoulder,
+            avg_shoulder_angle_deg=avg_shoulder,
+            avg_rula_proxy=avg_rula,
             risky_time_s=self.risky_posture_time_s,
             risky_cycle_count=self.risky_cycle_count,
             risky_cycle_ratio_total=risky_cycle_ratio_total,
+            completed_transfers=completed,
+            experiment_duration_s=experiment_duration_s,
+            avg_cycle_task_time_s=avg_cycle_time,
+            throughput_transfers_per_min=throughput_per_min,
+            early_stop_flag=self.early_stop_flag,
             system_interventions=self.system_intervention_count,
             adjust_count=self.robot_adjustment_count,
             avg_adj_mm=avg_adj_mm,
@@ -312,17 +332,6 @@ class ExperimentMetrics:
             llm_call_count=self.llm_call_count,
             llm_fallback_count=self.llm_fallback_count,
             avg_llm_latency_s=avg_llm_latency,
-            avg_representative_shoulder_angle_deg=avg_representative_shoulder,
-            avg_shoulder_angle_deg=avg_shoulder,
-            avg_rula_proxy=avg_rula,
-            risk_shoulder_threshold_deg=self.risk_shoulder_deg,
-            risky_cycle_ratio_threshold=self.risky_cycle_ratio_threshold,
-            user_height_cm=user_height_cm,
-            shoulder_height_cm=shoulder_height_cm,
-            upper_arm_cm=upper_arm_cm,
-            forearm_cm=forearm_cm,
-            drill_tcp_offset_cm=drill_tcp_offset_cm,
-            early_stop_flag=self.early_stop_flag,
         )
 
 
@@ -333,7 +342,7 @@ class ExperimentDataLogger:
         "Time", "Condition", "Trial_Num", "Lead_Type", "Control_Type", "Measured_Side",
         "Risk_Shoulder_Threshold_deg", "Risky_Cycle_Ratio_Threshold",
         "User_Height_cm", "Shoulder_Height_cm", "Upper_Arm_cm", "Forearm_cm", "Drill_TCP_Offset_cm",
-        "Task_Time_s", "Risky_Time_s", "Risky_Ratio", "Is_Risky_Cycle",
+        "Task_Time_s", "Rest_Time_s", "Working_Time_s", "Risky_Time_s", "Risky_Ratio", "Is_Risky_Cycle",
         "Visibility_OK_Time_s", "Visibility_OK_Ratio",
         "Representative_Shoulder_Angle_deg", "Avg_Shoulder_Angle_deg", "Avg_Elbow_Angle_deg",
         "Avg_RULA_Proxy", "Max_RULA_Proxy", "RULA_High_Ratio",
@@ -345,22 +354,29 @@ class ExperimentDataLogger:
     ]
 
     SUMMARY_HEADER = [
-        "Condition", "Completed_Transfers", "Measured_Side",
-        "Experiment_Duration_s", "Avg_Cycle_Task_Time_s",
+        "Condition", "Measured_Side",
+        "Risk_Shoulder_Threshold_deg", "Risky_Cycle_Ratio_Threshold",
+        "User_Height_cm", "Shoulder_Height_cm", "Upper_Arm_cm", "Forearm_cm", "Drill_TCP_Offset_cm",
+        "Avg_Representative_Shoulder_Angle_deg", "Avg_Shoulder_Angle_deg", "Avg_RULA_Proxy",
         "Risky_Time_s", "Risky_Cycle_Count", "Risky_Cycle_Ratio_Total",
+        "Completed_Transfers", "Experiment_Duration_s", "Avg_Cycle_Task_Time_s",
+        "Throughput_Transfers_Per_Min", "Early_Stop_Flag",
         "System_Interventions", "Adjust_Count", "Avg_Adj_mm", "Correction_Cmds", "Invalid_Cmds",
         "Worker_Approve_Count", "Worker_Reject_Count",
         "LLM_Call_Count", "LLM_Fallback_Count", "Avg_LLM_Latency_s",
-        "Avg_Representative_Shoulder_Angle_deg", "Avg_Shoulder_Angle_deg", "Avg_RULA_Proxy",
-        "Risk_Shoulder_Threshold_deg", "Risky_Cycle_Ratio_Threshold",
-        "User_Height_cm", "Shoulder_Height_cm", "Upper_Arm_cm", "Forearm_cm", "Drill_TCP_Offset_cm",
-        "Early_Stop_Flag",
     ]
 
     def __init__(self, result_dir: str) -> None:
         os.makedirs(result_dir, exist_ok=True)
-        self.raw_path = os.path.join(result_dir, "experiment_raw_data_per_trial.csv")
-        self.summary_path = os.path.join(result_dir, "experiment_summary_matrix.csv")
+        self.run_timestamp = time.strftime("%Y%m%d_%H%M%S")
+        self.raw_path = os.path.join(
+            result_dir,
+            f"{self.run_timestamp}_experiment_raw_data_per_trial.csv",
+        )
+        self.summary_path = os.path.join(
+            result_dir,
+            f"{self.run_timestamp}_experiment_summary_matrix.csv",
+        )
         self.pass_goal_dir = os.path.join(result_dir, "pass_goal_json")
         self.llm_response_dir = os.path.join(result_dir, "llm_response_json")
         os.makedirs(self.pass_goal_dir, exist_ok=True)
@@ -387,12 +403,16 @@ class ExperimentDataLogger:
 
         return path
 
-    def write_llm_response_json(self, payload: dict[str, Any], label: str) -> str:
-        self._llm_response_json_index += 1
-        timestamp = time.strftime("%Y%m%d_%H%M%S")
+    def write_llm_response_json(self, payload: dict[str, Any], label: str, condition_name: str) -> str:
         safe_label = _safe_filename_part(label)
-        filename = f"{timestamp}_{self._llm_response_json_index:03d}_{safe_label}.json"
+        safe_condition = _safe_filename_part(condition_name)
+        filename = f"{safe_condition}_{safe_label}.json"
         path = os.path.join(self.llm_response_dir, filename)
+        suffix = 2
+        while os.path.exists(path):
+            filename = f"{safe_condition}_{safe_label}_{suffix:02d}.json"
+            path = os.path.join(self.llm_response_dir, filename)
+            suffix += 1
 
         with open(path, "w", encoding="utf-8") as f:
             json.dump(payload, f, ensure_ascii=False, indent=2)
@@ -425,6 +445,8 @@ class ExperimentDataLogger:
             _round(record.forearm_cm, 1),
             _round(record.drill_tcp_offset_cm, 1),
             _round(cycle.task_time_s, 2),
+            _round(cycle.rest_time_s, 2),
+            _round(cycle.working_time_s, 2),
             _round(cycle.risky_time_s, 2),
             _round(cycle.risky_ratio, 3),
             cycle.is_risky_cycle,
@@ -466,13 +488,25 @@ class ExperimentDataLogger:
     def _summary_to_row(self, record: SummaryRecord) -> list[Any]:
         return [
             record.condition_name,
-            record.completed_transfers,
             record.measured_side,
-            _round(record.experiment_duration_s, 2),
-            _round(record.avg_cycle_task_time_s, 2),
+            record.risk_shoulder_threshold_deg,
+            record.risky_cycle_ratio_threshold,
+            _round(record.user_height_cm, 1),
+            _round(record.shoulder_height_cm, 1),
+            _round(record.upper_arm_cm, 1),
+            _round(record.forearm_cm, 1),
+            _round(record.drill_tcp_offset_cm, 1),
+            _round(record.avg_representative_shoulder_angle_deg, 2),
+            _round(record.avg_shoulder_angle_deg, 2),
+            _round(record.avg_rula_proxy, 2),
             _round(record.risky_time_s, 2),
             record.risky_cycle_count,
             _round(record.risky_cycle_ratio_total, 3),
+            record.completed_transfers,
+            _round(record.experiment_duration_s, 2),
+            _round(record.avg_cycle_task_time_s, 2),
+            _round(record.throughput_transfers_per_min, 3),
+            record.early_stop_flag,
             record.system_interventions,
             record.adjust_count,
             _round(record.avg_adj_mm, 1),
@@ -483,17 +517,6 @@ class ExperimentDataLogger:
             record.llm_call_count,
             record.llm_fallback_count,
             _round(record.avg_llm_latency_s, 2),
-            _round(record.avg_representative_shoulder_angle_deg, 2),
-            _round(record.avg_shoulder_angle_deg, 2),
-            _round(record.avg_rula_proxy, 2),
-            record.risk_shoulder_threshold_deg,
-            record.risky_cycle_ratio_threshold,
-            _round(record.user_height_cm, 1),
-            _round(record.shoulder_height_cm, 1),
-            _round(record.upper_arm_cm, 1),
-            _round(record.forearm_cm, 1),
-            _round(record.drill_tcp_offset_cm, 1),
-            record.early_stop_flag,
         ]
 
 
