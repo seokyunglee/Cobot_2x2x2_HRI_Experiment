@@ -73,21 +73,23 @@ Global adjustment logic:
 
 - safe_angle_range.default is the default safe shoulder target, usually 70 degrees.
 - safe_angle_range.min and safe_angle_range.max define the allowed functional safe range.
-- Keep every target_shoulder_angle_deg inside safe_angle_range.min and safe_angle_range.max.
+- You must output every target_shoulder_angle_deg inside safe_angle_range.min and safe_angle_range.max.
+- Never output a target_shoulder_angle_deg below safe_angle_range.min or above safe_angle_range.max.
 - If action is not "adjust", target_shoulder_angle_deg must be null.
 - If action is "adjust" and a shoulder-angle target can be computed, return target_shoulder_angle_deg.
 - For worker answers with a non-empty utterance, if no amount is stated but adjustment is otherwise clear, use amount_ratio=0.66.
 - Use amount_ratio=0.33 for small/slight/a little.
 - Use amount_ratio=0.66 for normal/default/moderate.
 - Use amount_ratio=1.0 for large/strong/max/as much as possible.
+- Plain up/down requests without an amount modifier, such as "올려줘" or "내려줘", are normal/default requests and must use amount_ratio=0.66.
 
 System review:
 
 - If utterance is empty, this is a system review.
 - System review has priority over all worker-answer rules.
 - For system review, amount_ratio must always be null.
-- If cycle_result.is_risky_cycle is true, return action="adjust", direction="none", amount_ratio=null, and target_shoulder_angle_deg=safe_angle_range.default.
-- If cycle_result.is_risky_cycle is false, return action="keep", direction="none", amount_ratio=null, and target_shoulder_angle_deg=null.
+- If cycle_result.is_risky_cycle is true or cycle_result.representative_shoulder_angle_deg >= 110.0, return action="adjust", direction="none", amount_ratio=null, and target_shoulder_angle_deg=safe_angle_range.default.
+- If cycle_result.is_risky_cycle is false and cycle_result.representative_shoulder_angle_deg < 110.0, return action="keep", direction="none", amount_ratio=null, and target_shoulder_angle_deg=null.
 
 Worker answer:
 
@@ -97,18 +99,31 @@ Worker answer:
 - Up examples: "올려", "높여", "위로", "조금 더 높게".
 - If the worker clearly wants the work height lower, return action="adjust", direction="down".
 - Down examples: "내려", "낮춰", "아래로", "조금 더 낮게".
-- If the worker agrees to adjust but gives no direction, return action="adjust", direction="none", amount_ratio=0.66 only when cycle_result.is_risky_cycle is true or is_first_completed_cycle is true; set target_shoulder_angle_deg=safe_angle_range.default.
-- If the worker asks for adjustment but direction is unclear and the cycle is not risky, return action="clarify".
+- For clear worker up/down answers, never leave target_shoulder_angle_deg null.
+- If cycle_result.is_risky_cycle is true or cycle_result.representative_shoulder_angle_deg >= 110.0, and the worker clearly says keep, up, or down, return action="adjust" with target_shoulder_angle_deg=safe_angle_range.default.
+- This risky-cycle rule has priority over the normal keep/up/down rules.
+- Do not use is_first_completed_cycle by itself to force the default target.
+- For worker answers, do not treat vague agreement, wake/sleep/power/audio commands, or unrelated phrases as a height-adjustment command.
+- Wake/sleep/power/audio examples such as "깨워줘", "깨워 줘", "꺼줘", "켜줘", "소리 꺼줘" must return action="clarify".
+- If the worker agrees to adjust but gives no up/down direction, return action="clarify".
+- If the worker asks for adjustment but direction is unclear, return action="clarify".
 - If the utterance is unrelated, unusable, or contradicts itself, return action="clarify".
 
 Target calculation:
 
-- If cycle_result.is_risky_cycle is true and adjustment is requested or required, use target_shoulder_angle_deg=safe_angle_range.default.
-- If is_first_completed_cycle is true and adjustment is requested or required, use target_shoulder_angle_deg=safe_angle_range.default.
-- If cycle_result.is_risky_cycle is false and the worker gives a clear up/down preference, calculate from baseline=cycle_result.representative_shoulder_angle_deg.
+- If cycle_result.is_risky_cycle is true or cycle_result.representative_shoulder_angle_deg >= 110.0, and adjustment is requested or required, use target_shoulder_angle_deg=safe_angle_range.default.
+- If cycle_result.is_risky_cycle is false, cycle_result.representative_shoulder_angle_deg < 110.0, and the worker gives a clear up/down preference, calculate from baseline=cycle_result.representative_shoulder_angle_deg.
+- If amount_ratio=1.0 and direction="down", target_shoulder_angle_deg must be exactly safe_angle_range.min.
+- If amount_ratio=1.0 and direction="up", target_shoulder_angle_deg must be exactly safe_angle_range.max.
+- If baseline is above safe_angle_range.max and direction="down" with normal amount, use safe_angle_range.default.
+- If baseline is below safe_angle_range.min and direction="up" with normal amount, use safe_angle_range.default.
 - For direction="up": target = baseline + (safe_angle_range.max - baseline) * amount_ratio.
 - For direction="down": target = baseline - (baseline - safe_angle_range.min) * amount_ratio.
-- Clamp the final target to [safe_angle_range.min, safe_angle_range.max].
+- If that formula would go below safe_angle_range.min, output exactly safe_angle_range.min.
+- If that formula would go above safe_angle_range.max, output exactly safe_angle_range.max.
+- For example, never output 59.7 when the minimum is 60.0; output 60.0. Never output 81.0 when the maximum is 80.0; output 80.0.
+- If baseline is at or above safe_angle_range.max, an upward request is unsafe and should return action="clarify".
+- If baseline is at or below safe_angle_range.min, a downward request is unsafe and should return action="clarify".
 
 Examples:
 
@@ -133,9 +148,34 @@ Output:
 {"action":"adjust","direction":"down","amount_ratio":0.66,"target_shoulder_angle_deg":63.4,"confidence":0.9,"reason":"default downward preference within safe range"}
 
 Input:
+{"task":"adjustment","utterance":"올려줘","is_first_completed_cycle":false,"cycle_result":{"is_risky_cycle":false,"representative_shoulder_angle_deg":65.0},"safe_angle_range":{"min":60.0,"default":70.0,"max":80.0}}
+Output:
+{"action":"adjust","direction":"up","amount_ratio":0.66,"target_shoulder_angle_deg":74.9,"confidence":0.9,"reason":"default upward preference within safe range"}
+
+Input:
+{"task":"adjustment","utterance":"최대한 내려줘","is_first_completed_cycle":false,"cycle_result":{"is_risky_cycle":false,"representative_shoulder_angle_deg":67.3},"safe_angle_range":{"min":60.0,"default":70.0,"max":80.0}}
+Output:
+{"action":"adjust","direction":"down","amount_ratio":1.0,"target_shoulder_angle_deg":60.0,"confidence":0.9,"reason":"worker wants maximum downward adjustment"}
+
+Input:
+{"task":"adjustment","utterance":"확 올려줘","is_first_completed_cycle":false,"cycle_result":{"is_risky_cycle":false,"representative_shoulder_angle_deg":51.0},"safe_angle_range":{"min":60.0,"default":70.0,"max":80.0}}
+Output:
+{"action":"adjust","direction":"up","amount_ratio":1.0,"target_shoulder_angle_deg":80.0,"confidence":0.9,"reason":"worker wants maximum upward adjustment"}
+
+Input:
+{"task":"adjustment","utterance":"올려줘","is_first_completed_cycle":false,"cycle_result":{"is_risky_cycle":true,"representative_shoulder_angle_deg":111.2},"safe_angle_range":{"min":60.0,"default":70.0,"max":80.0}}
+Output:
+{"action":"adjust","direction":"up","amount_ratio":0.66,"target_shoulder_angle_deg":70.0,"confidence":0.9,"reason":"risky posture requires default safe target despite upward request"}
+
+Input:
+{"task":"adjustment","utterance":"유지해줘","is_first_completed_cycle":false,"cycle_result":{"is_risky_cycle":true,"representative_shoulder_angle_deg":111.2},"safe_angle_range":{"min":60.0,"default":70.0,"max":80.0}}
+Output:
+{"action":"adjust","direction":"none","amount_ratio":null,"target_shoulder_angle_deg":70.0,"confidence":0.9,"reason":"risky posture overrides keep request with default safe target"}
+
+Input:
 {"task":"adjustment","utterance":"네 바꿔주세요","is_first_completed_cycle":true,"cycle_result":{"is_risky_cycle":true,"representative_shoulder_angle_deg":116.0},"safe_angle_range":{"min":60.0,"default":70.0,"max":80.0}}
 Output:
-{"action":"adjust","direction":"none","amount_ratio":0.66,"target_shoulder_angle_deg":70.0,"confidence":0.8,"reason":"agreement on first risky adjustment uses default safe target"}
+{"action":"clarify","direction":"none","amount_ratio":null,"target_shoulder_angle_deg":null,"confidence":0.75,"reason":"worker agreed to adjust but gave no direction"}
 
 Input:
 {"task":"adjustment","utterance":"좀 편하게 해줘","is_first_completed_cycle":false,"cycle_result":{"is_risky_cycle":false,"representative_shoulder_angle_deg":70.0},"safe_angle_range":{"min":60.0,"default":70.0,"max":80.0}}

@@ -72,9 +72,9 @@ def main() -> None:
 
     try:
         raw = input(" 1. 작업자 키(cm) [기본: 175.0]: ")
-        user_height_cm = float(raw) if raw.strip() else 175.0
+        user_height_cm = float(raw) if raw.strip() else 155.0
     except Exception:
-        user_height_cm = 175.0
+        user_height_cm = 155.0
 
     try:
         default_shoulder = user_height_cm - 30.0
@@ -107,11 +107,20 @@ def main() -> None:
         forearm_m=l2_cm / 100.0,
     )
     pose_generator = HumanAwareTcpPoseGenerator()
+    h_at_130_deg_m = pose_generator.floor_height_from_shoulder_angle(human_profile, 130.0)
+    h_at_60_deg_m = pose_generator.floor_height_from_shoulder_angle(human_profile, 60.0)
+    min_pose_h_m = pose_generator.min_floor_height_m
+    max_pose_h_m = pose_generator.max_floor_height_m
 
-    effective_safe_min_shoulder_angle_deg = PILOT_FUNCTIONAL_MIN_SHOULDER_DEG
-    effective_safe_max_shoulder_angle_deg = PILOT_FUNCTIONAL_MAX_SHOULDER_DEG
-    default_safe_shoulder_angle_deg = LLM_DEFAULT_SAFE_TARGET_DEG
-
+    print(
+        f"[어깨각 기준 목표 H] 130도={h_at_130_deg_m:.3f}m ({h_at_130_deg_m * 100.0:.1f}cm) | "
+        f"60도={h_at_60_deg_m:.3f}m ({h_at_60_deg_m * 100.0:.1f}cm)"
+    )
+    print(
+        f"[Pose H 범위] {min_pose_h_m:.3f}m~{max_pose_h_m:.3f}m | "
+        f"130도: {f'하한 clamp -> {min_pose_h_m:.3f}m' if h_at_130_deg_m < min_pose_h_m else f'상한 clamp -> {max_pose_h_m:.3f}m' if h_at_130_deg_m > max_pose_h_m else '범위 내'} | "
+        f"60도: {f'하한 clamp -> {min_pose_h_m:.3f}m' if h_at_60_deg_m < min_pose_h_m else f'상한 clamp -> {max_pose_h_m:.3f}m' if h_at_60_deg_m > max_pose_h_m else '범위 내'}"
+    )
 
     print("\n" + "=" * 60)
     for key_num, condition in CONDITIONS.items():
@@ -157,6 +166,8 @@ def main() -> None:
         rula_high_score_threshold=RULA_HIGH_SCORE_THRESHOLD,
     )
     data_logger = ExperimentDataLogger(RESULT_DIR)
+    print(f"[DATA RAW CSV] {data_logger.raw_path}")
+    print(f"[DATA SUMMARY CSV] {data_logger.summary_path}")
     
     review_cycle_result = None
     last_task_sample_time = 0.0
@@ -357,9 +368,9 @@ def main() -> None:
             intent = intent_interpreter.interpret_adjustment(
                 worker_text,
                 cycle_result,
-                effective_safe_min_shoulder_angle_deg,
-                default_safe_shoulder_angle_deg,
-                effective_safe_max_shoulder_angle_deg,
+                PILOT_FUNCTIONAL_MIN_SHOULDER_DEG,
+                LLM_DEFAULT_SAFE_TARGET_DEG,
+                PILOT_FUNCTIONAL_MAX_SHOULDER_DEG,
                 is_first_completed_cycle=(trial_count == 0),
                 is_system_review=is_system_review,
             )
@@ -563,8 +574,14 @@ def main() -> None:
     robot_state = "UNKNOWN"
     previous_robot_state = None
     next_robot_state_poll_time = 0.0
+    consecutive_camera_read_failures = 0
 
-    while cap.isOpened():
+    while True:
+        if not cap.isOpened():
+            print("[CAMERA ERROR] 카메라 연결이 닫혀 실험을 종료합니다.")
+            metrics.mark_early_stop()
+            break
+
         elapsed_time = time.time() - experiment_start_time
         manual_stop_requested = key in (27, ord("q"), ord("Q"))
         if elapsed_time >= MAX_EXPERIMENT_TIME_SEC or manual_stop_requested:

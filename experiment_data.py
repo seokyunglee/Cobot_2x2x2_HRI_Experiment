@@ -359,8 +359,15 @@ class ExperimentDataLogger:
 
     def __init__(self, result_dir: str) -> None:
         os.makedirs(result_dir, exist_ok=True)
-        self.raw_path = os.path.join(result_dir, "experiment_raw_data_per_trial.csv")
-        self.summary_path = os.path.join(result_dir, "experiment_summary_matrix.csv")
+        self.run_timestamp = time.strftime("%Y%m%d_%H%M%S")
+        self.raw_path = os.path.join(
+            result_dir,
+            f"{self.run_timestamp}_experiment_raw_data_per_trial.csv",
+        )
+        self.summary_path = os.path.join(
+            result_dir,
+            f"{self.run_timestamp}_experiment_summary_matrix.csv",
+        )
         self.pass_goal_dir = os.path.join(result_dir, "pass_goal_json")
         self.llm_response_dir = os.path.join(result_dir, "llm_response_json")
         os.makedirs(self.pass_goal_dir, exist_ok=True)
