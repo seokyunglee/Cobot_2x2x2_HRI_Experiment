@@ -25,6 +25,12 @@ SELECTED_LANDMARKS = {
     "wrist": mp_pose.PoseLandmark.RIGHT_WRIST.value,
     "hip": mp_pose.PoseLandmark.RIGHT_HIP.value,
 }
+NECK_EAR_LANDMARK = mp_pose.PoseLandmark.RIGHT_EAR.value
+
+# 측면 카메라 영상에서 참가자가 바라보는 방향의 x축 부호다.
+# 현재 -1은 화면 왼쪽을 향할 때 오른쪽 귀가 어깨보다 왼쪽으로 이동하는 것을 전방 기울기로 본다.
+# 카메라를 반대편에 설치하거나 영상을 좌우 반전하면 1.0으로 바꾼다.
+FORWARD_HEAD_DIRECTION_X = -1.0
 
 
 class PostureEstimator:
@@ -59,6 +65,7 @@ class PostureEstimator:
         elbow_pt = landmark_to_pixel(landmarks[SELECTED_LANDMARKS["elbow"]], width, height)
         wrist_pt = landmark_to_pixel(landmarks[SELECTED_LANDMARKS["wrist"]], width, height)
         hip_pt = landmark_to_pixel(landmarks[SELECTED_LANDMARKS["hip"]], width, height)
+        ear_pt = landmark_to_pixel(landmarks[NECK_EAR_LANDMARK], width, height)
 
         if USE_3D_LANDMARK_ANGLES and result.pose_world_landmarks:
             world_landmarks = result.pose_world_landmarks.landmark
@@ -73,11 +80,17 @@ class PostureEstimator:
             shoulder_angle_deg = calculate_angle(hip_pt, shoulder_pt, elbow_pt)
             elbow_angle_deg = calculate_angle(shoulder_pt, elbow_pt, wrist_pt)
         rula_proxy = estimate_rula_score(shoulder_angle_deg, elbow_angle_deg)
+        neck_forward_inclination_deg = (
+            calculate_forward_head_inclination_deg(shoulder_pt, ear_pt)
+            if landmarks[NECK_EAR_LANDMARK].visibility > VISIBILITY_THRESHOLD
+            else None
+        )
 
         return PostureSample(
             shoulder_angle_deg=shoulder_angle_deg,
             elbow_angle_deg=elbow_angle_deg,
             rula_proxy=rula_proxy,
+            neck_forward_inclination_deg=neck_forward_inclination_deg,
             visibility_ok=True,
             side=MEASURED_SIDE,
         )
@@ -91,6 +104,7 @@ def empty_posture_sample() -> PostureSample:
         shoulder_angle_deg=None,
         elbow_angle_deg=None,
         rula_proxy=None,
+        neck_forward_inclination_deg=None,
         visibility_ok=False,
         side=MEASURED_SIDE,
     )
@@ -141,6 +155,19 @@ def calculate_angle(a: list[int], b: list[int], c: list[int]) -> float:
     '''cos(theta) = (BA dot BC) / (|BA| * |BC|)'''
     cosine_angle = max(-1.0, min(1.0, dot_product / (mag_ba * mag_bc)))
     return math.degrees(math.acos(cosine_angle))
+
+
+def calculate_forward_head_inclination_deg(shoulder: list[int], ear: list[int]) -> float:
+    """측면 영상에서 귀-어깨 선의 전방 기울기를 수직선 기준으로 계산한다.
+
+    0도는 귀가 어깨 바로 위에 있는 상태이며, 설정된 전방 방향으로 귀가 이동할수록 값이 커진다.
+    후방 이동은 전방 기울기가 아니므로 0도로 기록한다.
+    """
+    forward_offset_px = (ear[0] - shoulder[0]) * FORWARD_HEAD_DIRECTION_X
+    vertical_rise_px = shoulder[1] - ear[1]
+    if forward_offset_px <= 0.0 or vertical_rise_px <= 0.0:
+        return 0.0
+    return math.degrees(math.atan2(forward_offset_px, vertical_rise_px))
 
 
 def estimate_rula_score(shoulder_angle_deg: float, elbow_angle_deg: float) -> int:

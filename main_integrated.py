@@ -18,6 +18,8 @@ from pose_generator import (
 from posture_estimator import MEASURED_SIDE, PostureEstimator
 from voice_intent_interface import (
     ACTION_COMPLETE,
+    AMOUNT_LARGE,
+    AMOUNT_SMALL,
     ContinuousSpeechRecognizer,
     LlmIntentInterpreter,
     QueuedTtsSpeaker,
@@ -31,7 +33,7 @@ LLAMA_BASE_URL = "https://api.groq.com/openai/v1"
 
 INITIAL_SHOULDER_ANGLE_DEG = 130.0
 MAX_TRIALS = 5
-PILOT_FUNCTIONAL_MIN_SHOULDER_DEG = 50.0
+PILOT_FUNCTIONAL_MIN_SHOULDER_DEG = 55.0
 PILOT_FUNCTIONAL_MAX_SHOULDER_DEG = 90.0
 LLM_DEFAULT_SAFE_TARGET_DEG = 70.0
 RULE_Z_STEP_M = 0.175
@@ -210,6 +212,7 @@ def main() -> None:
     )
     print(f"[DATA RAW CSV] {data_logger.raw_path}")
     print(f"[DATA SUMMARY CSV] {data_logger.summary_path}")
+    print(f"[DATA SHOULDER TIMESERIES CSV] {data_logger.shoulder_timeseries_path}")
     
     review_cycle_result = None
     waiting_for_chair_confirmation = False
@@ -218,6 +221,16 @@ def main() -> None:
     trial_count = 0
     experiment_start_time = 0.0
     finalized = False
+    cycle_target_shoulder_angle_deg = INITIAL_SHOULDER_ANGLE_DEG
+
+    def log_shoulder_timeline_sample(posture_sample, dt_s: float) -> None:
+        """Cycle 누적에 쓰인 같은 프레임·같은 dt를 원본 시계열로 저장한다."""
+        metrics.add_shoulder_timeline_sample(
+            elapsed_time_s=metrics.cycle_task_time_s,
+            dt_s=dt_s,
+            posture=posture_sample,
+            target_shoulder_angle_deg=cycle_target_shoulder_angle_deg,
+        )
 
     # Save pass-goal payloads for trial traceability.
     def save_pass_goal_json(payload: dict, label: str) -> None:
@@ -396,19 +409,6 @@ def main() -> None:
             is_approved=should_adjust,
             llm_latency_s=llm_latency_s,
             is_invalid=is_invalid,
-            cumulative_task_time_s=metrics.total_task_time_s,
-            cumulative_rest_time_s=metrics.total_rest_time_s,
-            cumulative_safe_time_s=metrics.total_safe_time_s,
-            cumulative_working_time_s=metrics.total_working_time_s,
-            cumulative_rest_ratio=(
-                metrics.total_rest_time_s / metrics.total_task_time_s
-                if metrics.total_task_time_s > 0
-                else 0.0
-            ),
-            cumulative_risky_time_s=metrics.risky_posture_time_s,
-            cumulative_adjustment_magnitude_mm=metrics.total_adjustment_magnitude_mm,
-            cumulative_completed_trials=metrics.completed_transfers,
-            cumulative_failed_trials=metrics.failed_trials,
             trial_result=trial_result,
             is_abandoned=trial_result == "fail",
             stop_reason=stop_reason,
@@ -422,6 +422,11 @@ def main() -> None:
         )
         data_logger.write_trial(trial_record)
         data_logger.write_shoulder_dwell(trial_number, trial_result, cycle.shoulder_samples)
+        data_logger.write_shoulder_timeseries(
+            trial_number,
+            trial_result,
+            cycle.shoulder_timeline_samples,
+        )
 
     # 종료 사유에 따라 실패 trial을 기록하고 실험 결과를 확정한다.
     def end_experiment(reason: str, cycle=None) -> None:
@@ -451,9 +456,9 @@ def main() -> None:
         metrics.finish_experiment(reason)
         if reason == "manual_stop":
             print("[MANUAL STOP] Q/ESC input detected.")
-            speak_and_wait("실험 중단 키가 입력되어 실험을 종료합니다.")
+            speak_and_wait("사용자 중단으로 실험을 종료합니다.")
         elif reason == "long_rest_abandonment":
-            speak_and_wait("15초 이상 휴식 상태가 지속되어 작업 포기로 간주하고 실험을 종료합니다.")
+            speak_and_wait("15초 이상 휴식이 지속되어 작업 포기로 처리되었습니다. 실험을 종료합니다.")
         elif reason == "max_trials_completed":
             print(f"[TRIAL LIMIT] {MAX_TRIALS} trials completed.")
 
@@ -513,7 +518,7 @@ def main() -> None:
         # 대표 어깨각도나 RULA proxy로 여기서 다시 위험 여부를 만들지 않는다.
         is_risky_cycle = bool(cycle_result.is_risky_cycle)
         condition_name = current_condition["name"]
-        worker_clarify_text = "잘 이해하지 못했습니다. 올려드릴까요 내려드릴까요 유지할까요?"
+        worker_clarify_text = "잘 이해하지 못했습니다. 얼만큼 조정할까요?"
 
         def keep_target() -> dict:
             return {
@@ -622,8 +627,7 @@ def main() -> None:
                     and current_target_shoulder_angle_deg >= PILOT_FUNCTIONAL_MAX_SHOULDER_DEG - 0.05
                 ):
                     next_question_text = (
-                        "현재 안전 범위에서 가장 높은 각도입니다. "
-                        "내려드릴까요 유지할까요?"
+                        "사용자 안전 각도의 상한입니다. 내릴까요, 유지할까요?"
                     )
                     continue
 
@@ -633,21 +637,18 @@ def main() -> None:
                     and current_target_shoulder_angle_deg <= PILOT_FUNCTIONAL_MIN_SHOULDER_DEG + 0.05
                 ):
                     next_question_text = (
-                        "현재 안전 범위에서 가장 낮은 각도입니다. "
-                        "올려드릴까요 유지할까요?"
+                        "사용자 안전 각도의 하한입니다. 올릴까요, 유지할까요?"
                     )
                     continue
 
                 if intent.direction == "up" and current_target_floor_height_m >= max_pose_h_m:
                     next_question_text = (
-                        "현재 로봇이 전달할 수 있는 최고 높이입니다. "
-                        "더 높여서 전달할 수 없습니다. 다시 말씀해 주세요."
+                        "로봇의 물리적 높이 상한입니다. 내릴까요, 유지할까요?"
                     )
                     continue
                 if intent.direction == "down" and current_target_floor_height_m <= min_pose_h_m:
                     next_question_text = (
-                        "현재 로봇이 전달할 수 있는 최저 높이입니다. "
-                        "더 낮춰서 전달할 수 없습니다. 다시 말씀해 주세요."
+                        "로봇의 물리적 높이 하한입니다. 올릴까요, 유지할까요?"
                     )
                     continue
                 return intent
@@ -658,7 +659,7 @@ def main() -> None:
                 # 위험하지 않으면 유지한다.
                 # 위험하면 빈 utterance로 조정 LLM을 호출하고 target_shoulder_angle_deg만 사용한다.
                 if not is_risky_cycle:
-                    speak_and_wait("안전자세가 감지되어 유지합니다.")
+                    speak("안전자세가 감지되어 유지합니다.")
                     return keep_target()
 
                 intent = call_system_adjustment_llm()
@@ -667,7 +668,7 @@ def main() -> None:
                     and intent.action == "adjust"
                     and intent.target_shoulder_angle_deg is not None
                 ):
-                    speak_and_wait("불편자세가 감지되어 조정합니다.")
+                    speak("불편자세가 감지되어 조정합니다.")
                     return with_intent_metadata(
                         shoulder_target(intent.target_shoulder_angle_deg),
                         intent,
@@ -682,10 +683,10 @@ def main() -> None:
                 # 위험하지 않으면 유지한다.
                 # 위험하면 현재 floor height에서 5cm 내린다.
                 if not is_risky_cycle:
-                    speak_and_wait("안전자세가 감지되어 유지합니다.")
+                    speak("안전자세가 감지되어 유지합니다.")
                     return keep_target()
 
-                speak_and_wait("불편자세가 감지되어 조정합니다.")
+                speak("불편자세가 감지되어 조정합니다.")
                 if current_target_floor_height_m <= min_pose_h_m:
                     raise RuntimeError("Cond2_Sys_Rule cannot lower because current target is already at min height.")
                 return floor_target(current_target_floor_height_m - RULE_Z_STEP_M)
@@ -696,32 +697,32 @@ def main() -> None:
                 # 작업자 답변은 조정 LLM으로 해석하고, target_shoulder_angle_deg만 실행에 사용한다.
                 # 답변이 비었거나 애매하면 같은 자리에서 다시 질문한다.
                 question_text = (
-                    "불편자세를 감지했습니다. 작업 높이를 변경해드릴까요?"
+                    "불편자세가 감지되었습니다. 얼만큼 조정해드릴까요?"
                     if is_risky_cycle
-                    else "안전자세가 감지되었으나 작업높이를 변경해드릴까요?"
+                    else "안전자세가 감지되었으나 높이를 얼마나 조정해드릴까요?"
                 )
                 intent = ask_worker_until_valid_intent(question_text)
                 if intent.action == "keep":
-                    speak_and_wait("네, 유지하겠습니다.")
+                    speak("네, 유지하겠습니다.")
                     return with_intent_metadata(keep_target(), intent)
                 if intent.target_shoulder_angle_deg is None:
                     raise RuntimeError("Cond3_Worker_LLM requires target_shoulder_angle_deg for adjust intent.")
                 if is_risky_cycle:
-                    speak_and_wait("네, 안전 각도로 조정하겠습니다.")
+                    speak("네, 안전 범위로 조정하겠습니다.")
                 elif intent.direction == "up":
-                    if intent.amount_ratio is not None and intent.amount_ratio <= 0.34:
-                        speak_and_wait("네, 조금 올리겠습니다.")
-                    elif intent.amount_ratio is not None and intent.amount_ratio >= 0.99:
-                        speak_and_wait("네, 강하게 올리겠습니다.")
+                    if intent.amount_ratio == AMOUNT_SMALL:
+                        speak("네, 조금 올려드리겠습니다.")
+                    elif intent.amount_ratio == AMOUNT_LARGE:
+                        speak("네, 많이 올려드리겠습니다.")
                     else:
-                        speak_and_wait("네, 올리겠습니다.")
+                        speak("네, 올려드리겠습니다.")
                 elif intent.direction == "down":
-                    if intent.amount_ratio is not None and intent.amount_ratio <= 0.34:
-                        speak_and_wait("네, 조금 내리겠습니다.")
-                    elif intent.amount_ratio is not None and intent.amount_ratio >= 0.99:
-                        speak_and_wait("네, 강하게 내리겠습니다.")
+                    if intent.amount_ratio == AMOUNT_SMALL:
+                        speak("네, 조금 내려드리겠습니다.")
+                    elif intent.amount_ratio == AMOUNT_LARGE:
+                        speak("네, 많이 내려드리겠습니다.")
                     else:
-                        speak_and_wait("네, 내리겠습니다.")
+                        speak("네, 내려드리겠습니다.")
                 else:
                     raise RuntimeError(f"Cond3_Worker_LLM requires direction up/down or risky adjustment, got {intent.direction!r}.")
                 return with_intent_metadata(
@@ -734,22 +735,22 @@ def main() -> None:
                 # 작업자 답변은 조정 LLM으로 해석하되 target_shoulder_angle_deg는 무조건 무시한다.
                 # 답변이 비었거나 방향이 애매하면 같은 자리에서 다시 질문한다.
                 question_text = (
-                    "자세 부담이 감지되었습니다. 작업높이를 변경할까요?"
+                    "불편자세가 감지되었습니다. 작업 높이를 조절해드릴까요?"
                     if is_risky_cycle
-                    else "자세 부담이 감지되지 않았습니다. 작업높이를 변경할까요?"
+                    else "안전자세가 감지되었으나 작업 높이를 조절해드릴까요?"
                 )
                 intent = ask_worker_until_valid_intent(question_text)
                 if intent.action == "keep":
-                    speak_and_wait("네, 유지하겠습니다.")
+                    speak("네, 유지하겠습니다.")
                     return with_intent_metadata(keep_target(), intent)
                 if intent.direction == "up":
-                    speak_and_wait("네, 룰 조건이라 고정 수치만큼 올라갑니다.")
+                    speak("네, 올려드리겠습니다.")
                     return with_intent_metadata(
                         floor_target(current_target_floor_height_m + RULE_Z_STEP_M),
                         intent,
                     )
                 if intent.direction == "down":
-                    speak_and_wait("네, 룰 조건이라 고정 수치만큼 내려갑니다.")
+                    speak("네, 내려드리겠습니다.")
                     return with_intent_metadata(
                         floor_target(current_target_floor_height_m - RULE_Z_STEP_M),
                         intent,
@@ -817,7 +818,7 @@ def main() -> None:
 
     initial_payload = initial_pose.to_pass_goal_dict(msg="Initial Trial Setup")
     save_pass_goal_json(initial_payload, "initial_pass_goal")
-    speak_and_wait("실험을 시작하겠습니다. 바른 자세로 로봇을 바라보고 앉아주세요.")
+    speak("실험을 시작 하겠습니다.")
     SendPassGoal(initial_payload)
     SetReviewPending(False)
 
@@ -883,7 +884,7 @@ def main() -> None:
                     # 로봇 상태가 AT_TASK로 새로 전환되었을 때만 작업 준비 상태를 초기화한다.
                     speech_recognizer.get_and_clear()
                     current_voice = None
-                    speak_and_wait("의자를 작업 위치로 옮겨주세요.")
+                    speak("의자를 옮겨주세요.")
                     print("[CHAIR CONFIRMATION] Press C when the chair is in position.")
                     waiting_for_chair_confirmation = True
                     review_cycle_result = None
@@ -895,9 +896,10 @@ def main() -> None:
                     waiting_for_chair_confirmation = False
                     speech_recognizer.get_and_clear()
                     current_voice = None
-                    speak("블록의 네 개 볼트에 있는 너트를 드릴로 빼주세요.")
+                    speak_and_wait("작업 시작")
                     metrics.start_cycle()
                     last_sample_time = 0.0
+                    cycle_target_shoulder_angle_deg = current_target_shoulder_angle_deg
                     key = -1
 
                 if not waiting_for_chair_confirmation and review_cycle_result is None:
@@ -906,6 +908,7 @@ def main() -> None:
                     dt = max(0.0, sample_time - last_sample_time) if last_sample_time else 0.0
                     last_sample_time = sample_time
                     long_rest_detected = metrics.add_posture_sample(posture_sample, dt)
+                    log_shoulder_timeline_sample(posture_sample, dt)
 
                     if long_rest_detected:
                         # 유효한 자세 인식에서 어깨각 40도 이하 휴식이 15초 이상 연속되면 포기로 종료한다.
@@ -937,13 +940,13 @@ def main() -> None:
                     if intent is not None and intent.action == ACTION_COMPLETE:
                         # 완료 의도가 확정되면 이번 cycle을 마감하고 로봇에 RETURNING 전환을 알린다.
                         print(f"[TASK COMPLETE] reason={intent.reason}")
-                        speak_and_wait("작업 완료를 확인했습니다. 블럭을 잡아주세요.")
+                        speak("작업 완료")
                         review_cycle_result = metrics.finish_cycle()
                         SendHoldFinished()
                     elif intent is not None:
                         # 음성은 들어왔지만 완료 의도가 아니거나 불명확하면 cycle은 유지한 채 재질문한다.
                         print(f"[TASK COMPLETION UNCLEAR] action={intent.action} reason={intent.reason}")
-                        speak_and_wait("의도 파악을 잘 못했습니다. 다시 한번 말씀해주세요.")
+                        speak_and_wait("다시 한번 말씀해주세요.")
                         speech_recognizer.get_and_clear()
                         current_voice = None
 

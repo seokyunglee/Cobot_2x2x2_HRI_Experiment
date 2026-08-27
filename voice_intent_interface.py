@@ -35,9 +35,9 @@ DIRECTION_DOWN = "down"
 DIRECTION_NONE = "none"
 VALID_DIRECTIONS = {DIRECTION_UP, DIRECTION_DOWN, DIRECTION_NONE}
 
-AMOUNT_SMALL = 0.33
-AMOUNT_NORMAL = 0.66
-AMOUNT_LARGE = 1.0
+AMOUNT_SMALL = 0.30
+AMOUNT_NORMAL = 0.50
+AMOUNT_LARGE = 0.70
 VALID_AMOUNT_RATIOS = {AMOUNT_SMALL, AMOUNT_NORMAL, AMOUNT_LARGE}
 
 TASK_COMPLETION_KEYWORDS = (
@@ -56,7 +56,6 @@ TASK_COMPLETION_KEYWORDS = (
     "다 뺐",
     "다풀었",
     "다 풀었",
-    "done",
 )
 
 
@@ -273,7 +272,7 @@ class LlmIntentInterpreter:
         self,
         api_key: str,
         base_url: str | None = None,
-        model: str = "llama-3.3-70b-versatile",
+        model: str = "openai/gpt-oss-120b",
         system_prompt_path: str | Path = DEFAULT_INTENT_PROMPT_PATH,
         task_completion_prompt_path: str | Path | None = None,
         system_adjustment_prompt_path: str | Path | None = None,
@@ -382,6 +381,34 @@ class LlmIntentInterpreter:
             },
             prompt_path=self.worker_adjustment_prompt_path,
         )
+
+        # LLM은 action/direction/amount_ratio만 해석하고, 목표 어깨각도는 Python 수식으로 계산한다.
+        if intent.action == ACTION_ADJUST:
+            # LLM이 반환한 target 값은 사용하지 않는다. 아래 Python 계산 결과만 사용한다.
+            intent.target_shoulder_angle_deg = None
+            min_angle = float(safe_min_shoulder_angle_deg)
+            default_angle = float(default_safe_shoulder_angle_deg)
+            max_angle = float(safe_max_shoulder_angle_deg)
+            current_angle = min(
+                max(float(current_target_shoulder_angle_deg), min_angle),
+                max_angle,
+            )
+
+            if is_first_completed_cycle:
+                target_angle = default_angle
+            elif intent.direction == DIRECTION_UP and intent.amount_ratio is not None:
+                target_angle = current_angle + ((max_angle - current_angle) * intent.amount_ratio)
+            elif intent.direction == DIRECTION_DOWN and intent.amount_ratio is not None:
+                target_angle = current_angle - ((current_angle - min_angle) * intent.amount_ratio)
+            else:
+                target_angle = None
+
+            if target_angle is not None:
+                intent.target_shoulder_angle_deg = round(
+                    min(max(float(target_angle), min_angle), max_angle),
+                    1,
+                )
+
         return self._attach_call_metadata(intent, user_voice=utterance)
 
     def _attach_call_metadata(
@@ -441,7 +468,7 @@ class LlmIntentInterpreter:
                     {"role": "user", "content": json.dumps(payload, ensure_ascii=False, indent=2)},
                 ],
                 temperature=self.temperature,
-                max_tokens=300,
+                max_tokens=512,
                 response_format={"type": "json_object"},
             )
             usage = getattr(response, "usage", None)
@@ -499,3 +526,4 @@ def _optional_float(value: Any) -> float | None:
         return float(value)
     except (TypeError, ValueError):
         return None
+

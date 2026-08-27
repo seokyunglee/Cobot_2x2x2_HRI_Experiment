@@ -14,6 +14,8 @@ from voice_intent_interface import (
     ACTION_COMPLETE,
     ACTION_KEEP,
     ACTION_NONE,
+    AMOUNT_LARGE,
+    AMOUNT_SMALL,
     ContinuousSpeechRecognizer,
     LlmIntentInterpreter,
     QueuedTtsSpeaker,
@@ -171,15 +173,15 @@ def dummy_send_pass_goal(pose_result, trial_number: int) -> None:
 
 def worker_llm_ack_text(intent) -> str:
     if intent.direction == "up":
-        if intent.amount_ratio is not None and intent.amount_ratio <= 0.34:
+        if intent.amount_ratio == AMOUNT_SMALL:
             return "네, 조금 올리겠습니다."
-        if intent.amount_ratio is not None and intent.amount_ratio >= 0.99:
+        if intent.amount_ratio == AMOUNT_LARGE:
             return "네, 강하게 올리겠습니다."
         return "네, 올리겠습니다."
     if intent.direction == "down":
-        if intent.amount_ratio is not None and intent.amount_ratio <= 0.34:
+        if intent.amount_ratio == AMOUNT_SMALL:
             return "네, 조금 내리겠습니다."
-        if intent.amount_ratio is not None and intent.amount_ratio >= 0.99:
+        if intent.amount_ratio == AMOUNT_LARGE:
             return "네, 강하게 내리겠습니다."
         return "네, 내리겠습니다."
     raise RuntimeError(f"Cond3_Worker_LLM requires direction up/down for safe adjustment, got {intent.direction!r}.")

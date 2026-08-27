@@ -18,7 +18,7 @@ MAX_ELBOW_FLEXION_DEG = 20.0
 ELBOW_FLEXION_EXPONENT = 2.0
 
 # 6차 측정 데이터 기준 바닥 높이 변환 상수다.
-BASE_HEIGHT_M = 0.6612
+BASE_HEIGHT_M = 0.661
 
 MeasuredPoseSample = tuple[
     float,

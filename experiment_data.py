@@ -18,8 +18,20 @@ class PostureSample:
     shoulder_angle_deg: float | None
     elbow_angle_deg: float | None
     rula_proxy: float | None
+    neck_forward_inclination_deg: float | None
     visibility_ok: bool
     side: str
+
+
+@dataclass
+class ShoulderTimelineSample:
+    """Cycle 중 일정 간격으로 저장하는 원본 어깨각 시계열 샘플."""
+
+    elapsed_time_s: float
+    dt_s: float
+    visibility_ok: bool
+    shoulder_angle_deg: float | None
+    target_shoulder_angle_deg: float
 
 
 @dataclass
@@ -43,11 +55,15 @@ class CycleResult:
     working_avg_shoulder_angle_deg: float
     avg_elbow_angle_deg: float
     working_avg_elbow_angle_deg: float
+    avg_neck_forward_inclination_deg: float | None
+    max_neck_forward_inclination_deg: float | None
+    neck_angle_visible_time_s: float
     avg_rula_proxy: float
     max_rula_proxy: float
     rula_high_time_s: float
     rula_high_ratio: float
     shoulder_samples: list[tuple[float, float]]
+    shoulder_timeline_samples: list[ShoulderTimelineSample]
 
 
 @dataclass
@@ -101,15 +117,6 @@ class TrialRecord:
     is_approved: bool
     llm_latency_s: float
     is_invalid: bool
-    cumulative_task_time_s: float
-    cumulative_rest_time_s: float
-    cumulative_safe_time_s: float
-    cumulative_working_time_s: float
-    cumulative_rest_ratio: float
-    cumulative_risky_time_s: float
-    cumulative_adjustment_magnitude_mm: float
-    cumulative_completed_trials: int
-    cumulative_failed_trials: int
     trial_result: str
     is_abandoned: bool
     stop_reason: str
@@ -252,15 +259,42 @@ class ExperimentMetrics:
         self.cycle_safe_time_s = 0.0
         self.cycle_risky_time_s = 0.0
         self.cycle_shoulder_samples: list[tuple[float, float]] = []
+        self.cycle_shoulder_timeline_samples: list[ShoulderTimelineSample] = []
         self.cycle_working_shoulder_samples: list[tuple[float, float]] = []
         self.cycle_shoulder_weighted_sum = 0.0
         self.cycle_elbow_weighted_sum = 0.0
         self.cycle_working_elbow_weighted_sum = 0.0
         self.cycle_working_visibility_ok_time_s = 0.0
+        self.cycle_neck_forward_weighted_sum = 0.0
+        self.cycle_neck_forward_max: float | None = None
+        self.cycle_neck_angle_visible_time_s = 0.0
         self.cycle_rula_weighted_sum = 0.0
         self.cycle_max_rula = 1.0
         self.cycle_rula_high_time_s = 0.0
         self.cycle_visibility_ok_time_s = 0.0
+
+    def add_shoulder_timeline_sample(
+        self,
+        elapsed_time_s: float,
+        dt_s: float,
+        posture: PostureSample,
+        target_shoulder_angle_deg: float,
+    ) -> None:
+        """유효·무효 인식을 모두 포함한 원본 시계열 샘플을 보관한다."""
+        shoulder_angle_deg = (
+            float(posture.shoulder_angle_deg)
+            if posture.shoulder_angle_deg is not None
+            else None
+        )
+        self.cycle_shoulder_timeline_samples.append(
+            ShoulderTimelineSample(
+                elapsed_time_s=max(0.0, elapsed_time_s),
+                dt_s=max(0.0, dt_s),
+                visibility_ok=bool(posture.visibility_ok),
+                shoulder_angle_deg=shoulder_angle_deg,
+                target_shoulder_angle_deg=float(target_shoulder_angle_deg),
+            )
+        )
 
     def add_posture_sample(self, posture: PostureSample, dt: float) -> bool:
         """AT_TASK 자세를 누적하고 연속 휴식 포기 여부를 반환한다."""
@@ -297,6 +331,14 @@ class ExperimentMetrics:
         self.cycle_elbow_weighted_sum += posture.elbow_angle_deg * dt
         self.cycle_rula_weighted_sum += posture.rula_proxy * dt
         self.cycle_max_rula = max(self.cycle_max_rula, float(posture.rula_proxy))
+        if posture.neck_forward_inclination_deg is not None:
+            neck_forward_inclination_deg = float(posture.neck_forward_inclination_deg)
+            self.cycle_neck_forward_weighted_sum += neck_forward_inclination_deg * dt
+            self.cycle_neck_angle_visible_time_s += dt
+            self.cycle_neck_forward_max = max(
+                self.cycle_neck_forward_max or 0.0,
+                neck_forward_inclination_deg,
+            )
 
         if posture.rula_proxy >= self.rula_high_score_threshold:
             self.cycle_rula_high_time_s += dt
@@ -309,10 +351,11 @@ class ExperimentMetrics:
 
     def finish_cycle(self) -> CycleResult:
         """현재 cycle 누적값을 평균/비율로 정리한다."""
-        task_time = self.cycle_task_time_s
-        rest_time = max(0.0, min(self.cycle_rest_time_s, task_time))
-        working_time = task_time - rest_time
-        visible_time = self.cycle_visibility_ok_time_s
+        task_time = max(0.0, self.cycle_task_time_s)
+        visible_time = max(0.0, min(self.cycle_visibility_ok_time_s, task_time))
+        rest_time = max(0.0, min(self.cycle_rest_time_s, visible_time))
+        # Working posture statistics also use only valid non-rest samples.
+        working_time = visible_time - rest_time
         risky_ratio = self.cycle_risky_time_s / visible_time if visible_time > 0 else 0.0
         visibility_ratio = self.cycle_visibility_ok_time_s / task_time if task_time > 0 else 0.0
         rula_high_ratio = self.cycle_rula_high_time_s / visible_time if visible_time > 0 else 0.0
@@ -346,11 +389,19 @@ class ExperimentMetrics:
                 if self.cycle_working_visibility_ok_time_s > 0
                 else 0.0
             ),
+            avg_neck_forward_inclination_deg=(
+                self.cycle_neck_forward_weighted_sum / self.cycle_neck_angle_visible_time_s
+                if self.cycle_neck_angle_visible_time_s > 0
+                else None
+            ),
+            max_neck_forward_inclination_deg=self.cycle_neck_forward_max,
+            neck_angle_visible_time_s=self.cycle_neck_angle_visible_time_s,
             avg_rula_proxy=self.cycle_rula_weighted_sum / visible_time if visible_time > 0 else 1.0,
             max_rula_proxy=self.cycle_max_rula,
             rula_high_time_s=self.cycle_rula_high_time_s,
             rula_high_ratio=max(0.0, min(1.0, rula_high_ratio)),
             shoulder_samples=list(self.cycle_shoulder_samples),
+            shoulder_timeline_samples=list(self.cycle_shoulder_timeline_samples),
         )
 
     def record_completed_trial(
@@ -414,7 +465,7 @@ class ExperimentMetrics:
         visible_time = cycle.visibility_ok_time_s
         self.cycle_representative_shoulder_angles.append((cycle.representative_shoulder_angle_deg, visible_time))
         self.cycle_avg_shoulder_angles.append((cycle.avg_shoulder_angle_deg, visible_time))
-        working_visible_time = max(0.0, visible_time - cycle.rest_time_s)
+        working_visible_time = cycle.working_time_s
         self.cycle_working_avg_shoulder_angles.append(
             (cycle.working_avg_shoulder_angle_deg, working_visible_time)
         )
@@ -588,6 +639,7 @@ class ExperimentDataLogger:
         "Representative_Shoulder_Angle_deg", "Working_Representative_Shoulder_Angle_deg",
         "Avg_Shoulder_Angle_deg", "Working_Avg_Shoulder_Angle_deg",
         "Avg_Elbow_Angle_deg", "Working_Avg_Elbow_Angle_deg", "Model_Elbow_Angle_deg",
+        "Avg_Neck_Forward_Inclination_deg", "Max_Neck_Forward_Inclination_deg", "Neck_Angle_Visible_Time_s",
         "Avg_RULA_Proxy", "Max_RULA_Proxy", "RULA_High_Time_s", "RULA_High_Ratio",
         "Representative_Shoulder_Angle_Change_deg", "Working_Representative_Shoulder_Angle_Change_deg",
         "Avg_RULA_Proxy_Change", "Rest_Time_Change_s", "Safe_Time_Change_s", "Risky_Time_Change_s",
@@ -597,9 +649,6 @@ class ExperimentDataLogger:
         "Prev_Z_mm", "Final_Z_mm", "Adjustment_Z_mm", "User_Voice", "Final_Z_m",
         "Model_Elbow_H_m", "Working_Elbow_H_m",
         "Pose_Height_Clamped", "Robot_Command_Sent", "Is_Approved", "LLM_Latency_s", "Is_Invalid",
-        "Cumulative_Task_Time_s", "Cumulative_Rest_Time_s", "Cumulative_Safe_Time_s", "Cumulative_Working_Time_s",
-        "Cumulative_Rest_Ratio", "Cumulative_Risky_Time_s", "Cumulative_Adjustment_Magnitude_mm",
-        "Cumulative_Completed_Trials", "Cumulative_Failed_Trials",
         "Trial_Result", "Is_Abandoned", "Stop_Reason",
         "Pose_X_m", "Pose_Y_m", "Pose_Z_m", "Pose_QX", "Pose_QY", "Pose_QZ", "Pose_QW",
     ]
@@ -641,6 +690,10 @@ class ExperimentDataLogger:
             result_dir,
             f"{self.filename_prefix}_shoulder_angle_dwell_per_trial.csv",
         )
+        self.shoulder_timeseries_path = os.path.join(
+            result_dir,
+            f"{self.filename_prefix}_shoulder_angle_timeseries_per_trial.csv",
+        )
         self.pass_goal_dir = os.path.join(result_dir, "pass_goal_json")
         self.llm_response_dir = os.path.join(result_dir, "llm_response_json")
         os.makedirs(self.pass_goal_dir, exist_ok=True)
@@ -679,6 +732,39 @@ class ExperimentDataLogger:
                     _round(duration, 2),
                 ])
 
+    def write_shoulder_timeseries(
+        self,
+        trial_num: int,
+        trial_result: str,
+        samples: list[ShoulderTimelineSample],
+    ) -> None:
+        """Cycle별 프레임 단위 원본 어깨각 시계열을 분석용 CSV로 저장한다."""
+        header = [
+            "Trial_Num",
+            "Trial_Result",
+            "Elapsed_Time_s",
+            "Dt_s",
+            "Visibility_OK",
+            "Shoulder_Angle_deg",
+            "Target_Shoulder_Angle_deg",
+        ]
+        self._append_rows(
+            self.shoulder_timeseries_path,
+            header,
+            [
+                [
+                    trial_num,
+                    trial_result,
+                    _round(sample.elapsed_time_s, 3),
+                    _round(sample.dt_s, 3),
+                    sample.visibility_ok,
+                    _round(sample.shoulder_angle_deg, 2),
+                    _round(sample.target_shoulder_angle_deg, 2),
+                ]
+                for sample in samples
+            ],
+        )
+
     def write_pass_goal_json(self, payload: dict[str, Any], label: str) -> str:
         safe_label = _safe_filename_part(label)
         filename = f"{self.filename_prefix}_{safe_label}.json"
@@ -712,12 +798,25 @@ class ExperimentDataLogger:
         return path
 
     def _append_row(self, filename: str, header: list[str], row: list[Any]) -> None:
+        self._append_rows(filename, header, [row])
+
+    def _append_rows(self, filename: str, header: list[str], rows: list[list[Any]]) -> None:
+        if not rows:
+            return
         header_needed = not os.path.isfile(filename) or os.path.getsize(filename) == 0
+        if not header_needed:
+            with open(filename, "r", encoding="utf-8-sig", newline="") as f:
+                existing_header = next(csv.reader(f), [])
+            if existing_header != header:
+                raise ValueError(
+                    f"Existing CSV schema does not match: {filename}. "
+                    "Use a new result directory or rename the previous result file."
+                )
         with open(filename, "a", encoding="utf-8-sig", newline="") as f:
             writer = csv.writer(f)
             if header_needed:
                 writer.writerow(header)
-            writer.writerow(row)
+            writer.writerows(rows)
 
     def _trial_to_row(self, record: TrialRecord) -> list[Any]:
         cycle = record.cycle
@@ -756,6 +855,9 @@ class ExperimentDataLogger:
             _round(cycle.avg_elbow_angle_deg, 2),
             _round(cycle.working_avg_elbow_angle_deg, 2),
             _round(record.model_elbow_angle_deg, 2),
+            _round(cycle.avg_neck_forward_inclination_deg, 2),
+            _round(cycle.max_neck_forward_inclination_deg, 2),
+            _round(cycle.neck_angle_visible_time_s, 2),
             _round(cycle.avg_rula_proxy, 2),
             _round(cycle.max_rula_proxy, 2),
             _round(cycle.rula_high_time_s, 2),
@@ -789,15 +891,6 @@ class ExperimentDataLogger:
             record.is_approved,
             _round(record.llm_latency_s, 2),
             record.is_invalid,
-            _round(record.cumulative_task_time_s, 2),
-            _round(record.cumulative_rest_time_s, 2),
-            _round(record.cumulative_safe_time_s, 2),
-            _round(record.cumulative_working_time_s, 2),
-            _round(record.cumulative_rest_ratio, 3),
-            _round(record.cumulative_risky_time_s, 2),
-            _round(record.cumulative_adjustment_magnitude_mm, 1),
-            record.cumulative_completed_trials,
-            record.cumulative_failed_trials,
             record.trial_result,
             record.is_abandoned,
             record.stop_reason,

@@ -9,7 +9,7 @@ Required JSON schema:
 {
   "action": "complete | adjust | keep | clarify | none",
   "direction": "up | down | none",
-  "amount_ratio": 0.33 or 0.66 or 1.0 or null,
+  "amount_ratio": 0.3 or 0.5 or 0.7 or null,
   "target_shoulder_angle_deg": number or null,
   "confidence": number,
   "reason": "short reason"
@@ -19,7 +19,7 @@ Field rules:
 
 - action must be one of: complete, adjust, keep, clarify, none.
 - direction must be one of: up, down, none.
-- amount_ratio must be one of: 0.33, 0.66, 1.0, null.
+- amount_ratio must be one of: 0.3, 0.5, 0.7, null.
 - target_shoulder_angle_deg must be a number or null.
 - confidence must be from 0.0 to 1.0.
 - Use null, not "null" as a string.
@@ -78,11 +78,11 @@ Global adjustment logic:
 - Never output a target_shoulder_angle_deg below safe_angle_range.min or above safe_angle_range.max.
 - If action is not "adjust", target_shoulder_angle_deg must be null.
 - If action is "adjust" and a shoulder-angle target can be computed, return target_shoulder_angle_deg.
-- For worker answers with a non-empty utterance, if no amount is stated but adjustment is otherwise clear, use amount_ratio=0.66.
-- Use amount_ratio=0.33 only when the utterance explicitly says small/slight/a little, such as "조금", "살짝", or "약간".
-- Use amount_ratio=0.66 for normal/default/moderate.
-- Use amount_ratio=1.0 only when the utterance explicitly says large/strong/max/as much as possible, such as "많이", "강하게", or "최대한".
-- Plain up/down requests without an amount modifier, such as "올려줘" or "내려줘", are normal/default requests and must use amount_ratio=0.66. Do not classify plain up/down as small.
+- For worker answers with a non-empty utterance, if no amount is stated but adjustment is otherwise clear, use amount_ratio=0.5.
+- Use amount_ratio=0.3 only when the utterance explicitly says small/slight/a little, such as "조금", "살짝", or "약간".
+- Use amount_ratio=0.5 for normal/default/moderate.
+- Use amount_ratio=0.7 only when the utterance explicitly says large/strong/max/as much as possible, such as "많이", "강하게", or "최대한".
+- Plain up/down requests without an amount modifier, such as "올려줘" or "내려줘", are normal/default requests and must use amount_ratio=0.5. Do not classify plain up/down as small.
 
 System review:
 
@@ -117,8 +117,7 @@ Target calculation:
 - If cycle_result.is_risky_cycle is false, cycle_result.representative_shoulder_angle_deg < 110.0, is_first_completed_cycle is false, and the worker gives a clear up/down preference, calculate from baseline=current_target_shoulder_angle_deg.
 - The baseline for worker preference adjustment is always current_target_shoulder_angle_deg.
 - Never use cycle_result.representative_shoulder_angle_deg as the baseline, remaining range, min/max check input, or amount calculation input. It is for risk context only.
-- If amount_ratio=1.0 and direction="down", target_shoulder_angle_deg must be exactly safe_angle_range.min.
-- If amount_ratio=1.0 and direction="up", target_shoulder_angle_deg must be exactly safe_angle_range.max.
+- A large request uses amount_ratio=0.7; apply the same target formula as every other amount ratio. Do not force the target to a boundary solely because the request is large.
 - If current_target_shoulder_angle_deg is above safe_angle_range.max and direction="down" with normal amount, use safe_angle_range.default.
 - If current_target_shoulder_angle_deg is below safe_angle_range.min and direction="up" with normal amount, use safe_angle_range.default.
 - For direction="up": target = baseline + (safe_angle_range.max - baseline) * amount_ratio.
@@ -135,12 +134,12 @@ Arithmetic self-check:
 - Round target_shoulder_angle_deg to one decimal place after calculation.
 - If direction="up", baseline < safe_angle_range.max, and amount_ratio > 0, target_shoulder_angle_deg must be greater than baseline. If it equals baseline, recalculate.
 - If direction="down", baseline > safe_angle_range.min, and amount_ratio > 0, target_shoulder_angle_deg must be less than baseline. If it equals baseline, recalculate.
-- With baseline=70.0, safe_angle_range.max=80.0, direction="up", amount_ratio=0.33, target_shoulder_angle_deg must be 73.3.
-- With baseline=70.0, safe_angle_range.max=80.0, direction="up", amount_ratio=0.66, target_shoulder_angle_deg must be 76.6. Do not output 75.99 or 70.0.
-- With baseline=80.0, safe_angle_range.max=80.0, direction="up", amount_ratio=0.66, target_shoulder_angle_deg must be 80.0 and direction must remain "up".
-- With baseline=80.0, safe_angle_range.max=80.0, direction="up", amount_ratio=1.0, target_shoulder_angle_deg must be 80.0 and direction must remain "up".
-- With baseline=70.0, safe_angle_range.min=60.0, direction="down", amount_ratio=0.33, target_shoulder_angle_deg must be 66.7.
-- With baseline=70.0, safe_angle_range.min=60.0, direction="down", amount_ratio=0.66, target_shoulder_angle_deg must be 63.4.
+- With baseline=70.0, safe_angle_range.max=80.0, direction="up", amount_ratio=0.3, target_shoulder_angle_deg must be 73.0.
+- With baseline=70.0, safe_angle_range.max=80.0, direction="up", amount_ratio=0.5, target_shoulder_angle_deg must be 75.0.
+- With baseline=80.0, safe_angle_range.max=80.0, direction="up", amount_ratio=0.5, target_shoulder_angle_deg must be 80.0 and direction must remain "up".
+- With baseline=80.0, safe_angle_range.max=80.0, direction="up", amount_ratio=0.7, target_shoulder_angle_deg must be 80.0 and direction must remain "up".
+- With baseline=70.0, safe_angle_range.min=60.0, direction="down", amount_ratio=0.3, target_shoulder_angle_deg must be 67.0.
+- With baseline=70.0, safe_angle_range.min=60.0, direction="down", amount_ratio=0.5, target_shoulder_angle_deg must be 65.0.
 
 Examples:
 
@@ -157,32 +156,32 @@ Output:
 Input:
 {"task":"adjustment","utterance":"조금 올려줘","is_first_completed_cycle":false,"current_target_shoulder_angle_deg":70.0,"cycle_result":{"is_risky_cycle":false,"representative_shoulder_angle_deg":69.5},"safe_angle_range":{"min":60.0,"default":70.0,"max":80.0}}
 Output:
-{"action":"adjust","direction":"up","amount_ratio":0.33,"target_shoulder_angle_deg":73.3,"confidence":0.9,"reason":"small upward preference within safe range"}
+{"action":"adjust","direction":"up","amount_ratio":0.3,"target_shoulder_angle_deg":73.0,"confidence":0.9,"reason":"small upward preference within safe range"}
 
 Input:
 {"task":"adjustment","utterance":"내려줘","is_first_completed_cycle":false,"current_target_shoulder_angle_deg":70.0,"cycle_result":{"is_risky_cycle":false,"representative_shoulder_angle_deg":69.0},"safe_angle_range":{"min":60.0,"default":70.0,"max":80.0}}
 Output:
-{"action":"adjust","direction":"down","amount_ratio":0.66,"target_shoulder_angle_deg":63.4,"confidence":0.9,"reason":"default downward preference within safe range"}
+{"action":"adjust","direction":"down","amount_ratio":0.5,"target_shoulder_angle_deg":65.0,"confidence":0.9,"reason":"default downward preference within safe range"}
 
 Input:
 {"task":"adjustment","utterance":"올려줘","is_first_completed_cycle":false,"current_target_shoulder_angle_deg":70.0,"cycle_result":{"is_risky_cycle":false,"representative_shoulder_angle_deg":65.0},"safe_angle_range":{"min":60.0,"default":70.0,"max":80.0}}
 Output:
-{"action":"adjust","direction":"up","amount_ratio":0.66,"target_shoulder_angle_deg":76.6,"confidence":0.9,"reason":"default upward preference from current target"}
+{"action":"adjust","direction":"up","amount_ratio":0.5,"target_shoulder_angle_deg":75.0,"confidence":0.9,"reason":"default upward preference from current target"}
 
 Input:
 {"task":"adjustment","utterance":"최대한 내려줘","is_first_completed_cycle":false,"current_target_shoulder_angle_deg":67.3,"cycle_result":{"is_risky_cycle":false,"representative_shoulder_angle_deg":70.2},"safe_angle_range":{"min":60.0,"default":70.0,"max":80.0}}
 Output:
-{"action":"adjust","direction":"down","amount_ratio":1.0,"target_shoulder_angle_deg":60.0,"confidence":0.9,"reason":"worker wants maximum downward adjustment"}
+{"action":"adjust","direction":"down","amount_ratio":0.7,"target_shoulder_angle_deg":62.2,"confidence":0.9,"reason":"worker wants a large downward adjustment"}
 
 Input:
 {"task":"adjustment","utterance":"확 올려줘","is_first_completed_cycle":false,"current_target_shoulder_angle_deg":65.0,"cycle_result":{"is_risky_cycle":false,"representative_shoulder_angle_deg":51.0},"safe_angle_range":{"min":60.0,"default":70.0,"max":80.0}}
 Output:
-{"action":"adjust","direction":"up","amount_ratio":1.0,"target_shoulder_angle_deg":80.0,"confidence":0.9,"reason":"worker wants maximum upward adjustment"}
+{"action":"adjust","direction":"up","amount_ratio":0.7,"target_shoulder_angle_deg":75.5,"confidence":0.9,"reason":"worker wants a large upward adjustment"}
 
 Input:
 {"task":"adjustment","utterance":"올려줘","is_first_completed_cycle":false,"current_target_shoulder_angle_deg":76.6,"cycle_result":{"is_risky_cycle":true,"representative_shoulder_angle_deg":111.2},"safe_angle_range":{"min":60.0,"default":70.0,"max":80.0}}
 Output:
-{"action":"adjust","direction":"up","amount_ratio":0.66,"target_shoulder_angle_deg":70.0,"confidence":0.9,"reason":"risky posture requires default safe target despite upward request"}
+{"action":"adjust","direction":"up","amount_ratio":0.5,"target_shoulder_angle_deg":70.0,"confidence":0.9,"reason":"risky posture requires default safe target despite upward request"}
 
 Input:
 {"task":"adjustment","utterance":"유지해줘","is_first_completed_cycle":false,"current_target_shoulder_angle_deg":76.6,"cycle_result":{"is_risky_cycle":true,"representative_shoulder_angle_deg":111.2},"safe_angle_range":{"min":60.0,"default":70.0,"max":80.0}}
